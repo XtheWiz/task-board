@@ -1,6 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as db from "./db.ts";
+import { syncFromTrello, pushToTrello } from "./trello.ts";
 
 export function registerTools(server: McpServer) {
   server.tool(
@@ -120,9 +121,28 @@ export function registerTools(server: McpServer) {
           ],
         };
       }
+
+      // Auto-push to Trello if linked
+      let trelloResult = "";
+      if (task.trello_card_id) {
+        try {
+          const result = await pushToTrello(task_id);
+          trelloResult = result.success
+            ? "\n\nTrello: " + result.message
+            : "\n\nTrello sync failed: " + result.message;
+        } catch (e) {
+          trelloResult =
+            "\n\nTrello sync error: " +
+            (e instanceof Error ? e.message : String(e));
+        }
+      }
+
       return {
         content: [
-          { type: "text" as const, text: JSON.stringify(task, null, 2) },
+          {
+            type: "text" as const,
+            text: JSON.stringify(task, null, 2) + trelloResult,
+          },
         ],
       };
     },
@@ -167,6 +187,62 @@ export function registerTools(server: McpServer) {
           { type: "text" as const, text: JSON.stringify(summary, null, 2) },
         ],
       };
+    },
+  );
+
+  server.tool(
+    "sync_trello",
+    "Pull [agent]-tagged cards from Trello into Task Board. Syncs only new/modified cards since last sync.",
+    {},
+    async () => {
+      try {
+        const result = await syncFromTrello();
+        const lines = [
+          `Synced: ${result.created} new task(s) created, ${result.skipped} already synced`,
+        ];
+        if (result.errors.length > 0) {
+          lines.push("Errors:", ...result.errors.map((e) => "  - " + e));
+        }
+        return {
+          content: [{ type: "text" as const, text: lines.join("\n") }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "Sync failed: " + (e instanceof Error ? e.message : String(e)),
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  server.tool(
+    "push_trello",
+    "Manually push a completed task back to Trello — moves card to Review list and adds summary comment",
+    {
+      task_id: z.string().describe("The task ID to push to Trello"),
+    },
+    async ({ task_id }) => {
+      try {
+        const result = await pushToTrello(task_id);
+        return {
+          content: [{ type: "text" as const, text: result.message }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "Push failed: " + (e instanceof Error ? e.message : String(e)),
+            },
+          ],
+        };
+      }
     },
   );
 }

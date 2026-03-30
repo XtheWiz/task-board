@@ -29,9 +29,24 @@ export function getDb(): Database {
         assigned_at TEXT NOT NULL DEFAULT (datetime('now')),
         completed_at TEXT,
         summary TEXT,
-        updates TEXT DEFAULT '[]'
+        updates TEXT DEFAULT '[]',
+        trello_card_id TEXT,
+        trello_board_id TEXT
       )
     `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS sync_state (
+        key TEXT PRIMARY KEY,
+        value TEXT
+      )
+    `);
+    // Migrate existing DBs — add Trello columns if missing
+    try {
+      db.exec("ALTER TABLE tasks ADD COLUMN trello_card_id TEXT");
+    } catch {}
+    try {
+      db.exec("ALTER TABLE tasks ADD COLUMN trello_board_id TEXT");
+    } catch {}
   }
   return db;
 }
@@ -51,6 +66,8 @@ function rowToTask(row: Record<string, unknown>): Task {
     completed_at: row["completed_at"] as string | undefined,
     summary: row["summary"] as string | undefined,
     updates: parseJson(row["updates"] as string | null) ?? [],
+    trello_card_id: (row["trello_card_id"] as string) || undefined,
+    trello_board_id: (row["trello_board_id"] as string) || undefined,
   };
 }
 
@@ -66,8 +83,8 @@ function parseJson<T>(value: string | null): T | undefined {
 export function createTask(input: CreateTaskInput): Task {
   const id = randomUUIDv7();
   const stmt = getDb().prepare(`
-    INSERT INTO tasks (id, role, title, description, scope, context_files, constraints, done_when)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tasks (id, role, title, description, scope, context_files, constraints, done_when, trello_card_id, trello_board_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     id,
@@ -78,6 +95,8 @@ export function createTask(input: CreateTaskInput): Task {
     input.context_files ? JSON.stringify(input.context_files) : null,
     input.constraints ? JSON.stringify(input.constraints) : null,
     input.done_when,
+    input.trello_card_id ?? null,
+    input.trello_board_id ?? null,
   );
   return getTask(id)!;
 }
@@ -165,4 +184,24 @@ export function listTasks(role?: string, status?: TaskStatus): Task[] {
     .prepare(query)
     .all(...params) as Record<string, unknown>[];
   return rows.map(rowToTask);
+}
+
+export function getSyncState(key: string): string | null {
+  const row = getDb()
+    .prepare("SELECT value FROM sync_state WHERE key = ?")
+    .get(key) as { value: string } | null;
+  return row?.value ?? null;
+}
+
+export function setSyncState(key: string, value: string): void {
+  getDb()
+    .prepare("INSERT OR REPLACE INTO sync_state (key, value) VALUES (?, ?)")
+    .run(key, value);
+}
+
+export function findTaskByTrelloCard(cardId: string): Task | null {
+  const row = getDb()
+    .prepare("SELECT * FROM tasks WHERE trello_card_id = ?")
+    .get(cardId) as Record<string, unknown> | null;
+  return row ? rowToTask(row) : null;
 }

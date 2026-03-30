@@ -14,6 +14,8 @@ export interface Task {
   completed_at?: string;
   summary?: string;
   updates?: TaskUpdate[];
+  trello_card_id?: string;
+  trello_board_id?: string;
 }
 
 export interface TaskUpdate {
@@ -28,6 +30,23 @@ export interface CreateTaskInput {
   scope?: string[];
   context_files?: string[];
   constraints?: { must?: string[]; must_not?: string[] };
+  done_when: string;
+  trello_card_id?: string;
+  trello_board_id?: string;
+}
+
+export interface TrelloConfig {
+  apiKey: string;
+  token: string;
+  boardId: string;
+  reviewList?: string;
+}
+
+export interface ParsedCard {
+  title: string;
+  role: string;
+  description?: string;
+  scope?: string[];
   done_when: string;
 }
 

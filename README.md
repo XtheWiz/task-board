@@ -133,6 +133,93 @@ Coordinator session:
   → list_tasks()                     // Sees all tasks with statuses
 ```
 
+## Trello Integration
+
+Bridge human project management with AI agent execution. Tag Trello cards with `[agent]` and they sync into Task Board.
+
+### How it works
+
+1. **Humans** create cards on Trello as usual
+2. **You** review and add an `[agent]` label (or title prefix like `[backend]`, `[qa]`)
+3. **`sync_trello`** pulls tagged cards into Task Board as tasks
+4. **Agents** receive and complete tasks normally
+5. **`complete_task`** auto-pushes results back — moves card to "Review" list with a summary comment
+
+### Setup
+
+Add Trello env vars to your MCP config:
+
+```json
+{
+  "mcpServers": {
+    "taskboard": {
+      "command": "bun",
+      "args": ["run", "/path/to/task-board/src/index.ts"],
+      "env": {
+        "TASKBOARD_DB": "/path/to/taskboard.db",
+        "TRELLO_API_KEY": "your-api-key",
+        "TRELLO_TOKEN": "your-token",
+        "TRELLO_BOARD_ID": "your-board-id",
+        "TRELLO_REVIEW_LIST": "Review"
+      }
+    }
+  }
+}
+```
+
+Get your API key at [trello.com/app-key](https://trello.com/app-key). Generate a token with read/write access.
+
+### Role mapping
+
+| Trello card                     | Task Board role            |
+| ------------------------------- | -------------------------- |
+| `[agent]` label or title prefix | `po` (coordinator triages) |
+| `[backend]` label or prefix     | `backend`                  |
+| `[qa]` label or prefix          | `qa`                       |
+| `[anything]`                    | That role name             |
+
+Labels take priority over title prefixes.
+
+### Smart description parsing
+
+If a Trello card description contains structured headers, they're extracted:
+
+```
+Scope:
+- Add rate limiter middleware
+- Apply to /auth/* routes
+
+Done when: Rate limiter returns 429 after 5 attempts
+
+The login endpoint is getting hit by bots.
+```
+
+Parsed as:
+
+- `scope`: `["Add rate limiter middleware", "Apply to /auth/* routes"]`
+- `done_when`: `"Rate limiter returns 429 after 5 attempts"`
+- `description`: `"The login endpoint is getting hit by bots."`
+
+If no headers are found, the full description is used as-is and `done_when` defaults to `"PO to define"`.
+
+### `sync_trello`
+
+Pull `[agent]`-tagged cards from Trello. Only fetches cards modified since last sync.
+
+```
+sync_trello({})
+// → "Synced: 3 new task(s) created, 1 already synced"
+```
+
+### `push_trello`
+
+Manually push a task back to Trello (auto-fires on `complete_task` for linked cards).
+
+```
+push_trello({ task_id: "abc-123" })
+// → "Card moved to Review with summary comment"
+```
+
 ## Task Lifecycle
 
 ```
@@ -148,9 +235,13 @@ pending → in_progress → done
 
 ## Configuration
 
-| Environment Variable | Default        | Description                  |
-| -------------------- | -------------- | ---------------------------- |
-| `TASKBOARD_DB`       | `taskboard.db` | Path to SQLite database file |
+| Environment Variable | Default        | Description                                 |
+| -------------------- | -------------- | ------------------------------------------- |
+| `TASKBOARD_DB`       | `taskboard.db` | Path to SQLite database file                |
+| `TRELLO_API_KEY`     | —              | Trello API key (optional, for Trello sync)  |
+| `TRELLO_TOKEN`       | —              | Trello user token with read/write access    |
+| `TRELLO_BOARD_ID`    | —              | Trello board ID to sync                     |
+| `TRELLO_REVIEW_LIST` | `Review`       | Name of the Trello list for completed tasks |
 
 ## License
 
