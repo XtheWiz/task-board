@@ -1,0 +1,32 @@
+{
+  "name": "@xthewiz/task-board",
+  "version": "0.1.0",
+  "description": "A lightweight MCP task board for AI agent teams",
+  "module": "src/index.ts",
+  "type": "module",
+  "bin": {
+    "task-board": "src/index.ts"
+  },
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts"
+  },
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "task-board",
+    "claude-code",
+    "multi-agent"
+  ],
+  "author": "XtheWiz",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.28.0"
+  }
+}
