@@ -63,12 +63,10 @@ async function trelloGet<T>(
 async function trelloPost(
   path: string,
   config: TrelloConfig,
-  body?: Record<string, string>,
+  params?: Record<string, string>,
 ): Promise<unknown> {
-  const res = await fetch(trelloUrl(path, config), {
+  const res = await fetch(trelloUrl(path, config, params), {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body ? JSON.stringify(body) : undefined,
   });
   if (!res.ok)
     throw new Error(`Trello API error: ${res.status} ${await res.text()}`);
@@ -222,6 +220,19 @@ async function claimCard(
   await trelloPost(`/cards/${cardId}/idLabels`, config, { value: labelId });
 }
 
+let resolvedBoardId: string | null = null;
+
+async function getFullBoardId(config: TrelloConfig): Promise<string> {
+  if (resolvedBoardId) return resolvedBoardId;
+  const board = await trelloGet<{ id: string }>(
+    `/boards/${config.boardId}`,
+    config,
+    { fields: "id" },
+  );
+  resolvedBoardId = board.id;
+  return board.id;
+}
+
 async function getOrCreateReviewList(config: TrelloConfig): Promise<string> {
   const lists = await trelloGet<TrelloList[]>(
     `/boards/${config.boardId}/lists`,
@@ -233,10 +244,11 @@ async function getOrCreateReviewList(config: TrelloConfig): Promise<string> {
   );
   if (existing) return existing.id;
 
-  // Create the Review list
+  // Create the Review list — needs full board ID
+  const fullBoardId = await getFullBoardId(config);
   const created = (await trelloPost("/lists", config, {
     name: reviewListName,
-    idBoard: config.boardId,
+    idBoard: fullBoardId,
     pos: "bottom",
   })) as TrelloList;
   return created.id;
