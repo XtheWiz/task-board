@@ -9,7 +9,9 @@ export function registerTools(server: McpServer) {
     {
       role: z
         .string()
-        .describe("The role to assign this task to (e.g. devteam, qa, uxui)"),
+        .describe(
+          "The role to assign this task to (e.g. backend, frontend, qa)",
+        ),
       title: z.string().describe("Brief task title"),
       description: z
         .string()
@@ -48,7 +50,7 @@ export function registerTools(server: McpServer) {
     "receive_task",
     "Pull your current task (filtered by role). Automatically marks it as in_progress.",
     {
-      role: z.string().describe("Your role (e.g. devteam, qa, uxui)"),
+      role: z.string().describe("Your role (e.g. backend, frontend, qa)"),
     },
     async ({ role }) => {
       const task = db.receiveTask(role);

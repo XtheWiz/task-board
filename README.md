@@ -2,7 +2,7 @@
 
 A lightweight MCP task board for AI agent teams. Agents receive tasks, post updates, and complete work — all through MCP tools. No channels, no chat, no noise.
 
-Built for multi-agent workflows where a coordinator (like a Product Owner) assigns tasks to specialized agents (DevTeam, QA, UXUI, etc.) and tracks progress.
+Built for multi-agent workflows where a coordinator assigns tasks to specialized agents (backend, frontend, QA, etc.) and tracks progress.
 
 ## Why
 
@@ -10,13 +10,13 @@ When running multiple AI agents (Claude Code tabs, Codex, Gemini CLI), they need
 
 Task Board gives each agent exactly what it needs: **its current task, nothing more.**
 
-| Feature                        | Chat/Walkie | File-based       | Task Board |
-| ------------------------------ | ----------- | ---------------- | ---------- |
-| Token cost per interaction     | ~200-600    | 0 (manual carry) | ~50        |
-| Agent sees irrelevant messages | Yes         | N/A              | No         |
-| Scales with team size          | Poorly      | Poorly           | Well       |
-| Project file clutter           | None        | Yes              | None       |
-| Structured task scoping        | No          | Manual           | Built-in   |
+| Feature                        | Chat channels | File-based       | Task Board |
+| ------------------------------ | ------------- | ---------------- | ---------- |
+| Token cost per interaction     | ~200-600      | 0 (manual carry) | ~50        |
+| Agent sees irrelevant messages | Yes           | N/A              | No         |
+| Scales with team size          | Poorly        | Poorly           | Well       |
+| Project file clutter           | None          | Yes              | None       |
+| Structured task scoping        | No            | Manual           | Built-in   |
 
 ## Quick Start
 
@@ -60,16 +60,16 @@ Assign a task to a role with scope and done criteria.
 
 ```
 create_task({
-  role: "devteam",
-  title: "Fix playStyles bug in create match flow",
-  description: "Match Vibe toggle doesn't populate playStyles list",
-  scope: ["Fix create_match_screen.dart"],
-  context_files: ["apps/mobile/lib/presentation/screens/create_match_screen.dart"],
+  role: "backend",
+  title: "Add rate limiting to auth endpoints",
+  description: "Login and register endpoints need rate limiting to prevent brute force",
+  scope: ["Add rate limiter middleware", "Apply to /auth/* routes"],
+  context_files: ["src/middleware/auth.ts", "src/routes/auth.ts"],
   constraints: {
-    must: ["Sync matchVibe to selectedPlayStyles"],
-    must_not: ["Change the Match Vibe UI"]
+    must: ["Use sliding window algorithm", "Return 429 with Retry-After header"],
+    must_not: ["Change existing auth logic", "Add new dependencies"]
   },
-  done_when: "Match submits with correct playStyles payload"
+  done_when: "Rate limiter active on auth routes, returns 429 after 5 attempts per minute"
 })
 ```
 
@@ -78,7 +78,7 @@ create_task({
 Pull your current task. Automatically marks it as `in_progress`.
 
 ```
-receive_task({ role: "devteam" })
+receive_task({ role: "backend" })
 ```
 
 Returns the oldest pending/in-progress task for that role. If a task is `pending`, it transitions to `in_progress` when received.
@@ -91,7 +91,7 @@ Post a progress update or change task status.
 update_task({
   task_id: "abc-123",
   status: "blocked",
-  message: "Waiting for API contract update from backend team"
+  message: "Need Redis connection config before implementing sliding window"
 })
 ```
 
@@ -102,7 +102,7 @@ Mark a task as done with a summary of what was accomplished.
 ```
 complete_task({
   task_id: "abc-123",
-  summary: "Fixed in create_match_screen.dart:291-293. Synced matchVibe → selectedPlayStyles. Tests pass (648 green)."
+  summary: "Added sliding window rate limiter in src/middleware/rate-limit.ts. Applied to all /auth/* routes. Tests pass."
 })
 ```
 
@@ -111,25 +111,25 @@ complete_task({
 See all tasks, optionally filtered by role and/or status.
 
 ```
-list_tasks({})                          // All tasks
-list_tasks({ role: "devteam" })         // DevTeam's tasks
-list_tasks({ status: "pending" })       // All pending
-list_tasks({ role: "qa", status: "done" }) // QA's completed tasks
+list_tasks({})                              // All tasks
+list_tasks({ role: "backend" })             // Backend's tasks
+list_tasks({ status: "pending" })           // All pending
+list_tasks({ role: "qa", status: "done" })  // QA's completed tasks
 ```
 
 ## Workflow Example
 
 ```
-PO session:
-  → create_task(role: "devteam", title: "Fix X", done_when: "...")
+Coordinator session:
+  → create_task(role: "backend", title: "Add rate limiting", done_when: "...")
 
-DevTeam session:
-  → receive_task(role: "devteam")    // Gets the task, marks in_progress
+Backend session:
+  → receive_task(role: "backend")    // Gets the task, marks in_progress
   → (does the work)
-  → update_task(task_id, message: "halfway done, tests passing")
-  → complete_task(task_id, summary: "Fixed in file.dart, commit abc123")
+  → update_task(task_id, message: "Middleware done, writing tests")
+  → complete_task(task_id, summary: "Rate limiter added, 12 tests pass")
 
-PO session:
+Coordinator session:
   → list_tasks()                     // Sees all tasks with statuses
 ```
 
