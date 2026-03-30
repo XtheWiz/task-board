@@ -22,6 +22,7 @@ function getConfig(): TrelloConfig {
   const token = process.env["TRELLO_TOKEN"];
   const boardId = process.env["TRELLO_BOARD_ID"];
   const reviewList = process.env["TRELLO_REVIEW_LIST"] || "Review";
+  const claimedLabel = process.env["TRELLO_CLAIMED_LABEL"] || "claimed";
 
   if (!apiKey || !token || !boardId) {
     throw new Error(
@@ -29,7 +30,7 @@ function getConfig(): TrelloConfig {
     );
   }
 
-  return { apiKey, token, boardId, reviewList };
+  return { apiKey, token, boardId, reviewList, claimedLabel };
 }
 
 function trelloUrl(
@@ -182,6 +183,45 @@ export function parseCard(card: TrelloCard): ParsedCard {
   };
 }
 
+async function getOrCreateLabel(
+  config: TrelloConfig,
+  name: string,
+  color: string = "sky",
+): Promise<string> {
+  const labels = await trelloGet<{ id: string; name: string }[]>(
+    `/boards/${config.boardId}/labels`,
+    config,
+  );
+  const existing = labels.find(
+    (l) => l.name.toLowerCase() === name.toLowerCase(),
+  );
+  if (existing) return existing.id;
+
+  const created = (await trelloPost(
+    `/boards/${config.boardId}/labels`,
+    config,
+    {
+      name,
+      color,
+    },
+  )) as { id: string };
+  return created.id;
+}
+
+function isClaimed(card: TrelloCard, claimedLabel: string): boolean {
+  return card.labels.some(
+    (l) => l.name.toLowerCase() === claimedLabel.toLowerCase(),
+  );
+}
+
+async function claimCard(
+  cardId: string,
+  labelId: string,
+  config: TrelloConfig,
+): Promise<void> {
+  await trelloPost(`/cards/${cardId}/idLabels`, config, { value: labelId });
+}
+
 async function getOrCreateReviewList(config: TrelloConfig): Promise<string> {
   const lists = await trelloGet<TrelloList[]>(
     `/boards/${config.boardId}/lists`,
@@ -255,8 +295,12 @@ export async function syncFromTrello(): Promise<{
     params,
   );
 
+  const claimedLabelName = config.claimedLabel || "claimed";
+  let claimedLabelId: string | null = null;
+
   let created = 0;
   let skipped = 0;
+  let claimed = 0;
   const errors: string[] = [];
 
   for (const card of cards) {
@@ -264,7 +308,18 @@ export async function syncFromTrello(): Promise<{
       continue;
     }
 
-    // Skip if already synced
+    // Skip if claimed by another machine
+    if (isClaimed(card, claimedLabelName)) {
+      // But still skip-count if we already have it locally
+      if (db.findTaskByTrelloCard(card.id)) {
+        skipped++;
+      } else {
+        claimed++;
+      }
+      continue;
+    }
+
+    // Skip if already synced locally
     if (db.findTaskByTrelloCard(card.id)) {
       skipped++;
       continue;
@@ -281,6 +336,17 @@ export async function syncFromTrello(): Promise<{
         trello_card_id: card.id,
         trello_board_id: config.boardId,
       });
+
+      // Claim the card on Trello so other machines skip it
+      if (!claimedLabelId) {
+        claimedLabelId = await getOrCreateLabel(
+          config,
+          claimedLabelName,
+          "sky",
+        );
+      }
+      await claimCard(card.id, claimedLabelId, config);
+
       created++;
     } catch (e) {
       errors.push(
@@ -291,7 +357,7 @@ export async function syncFromTrello(): Promise<{
 
   db.setSyncState("last_trello_sync", new Date().toISOString());
 
-  return { created, skipped, errors };
+  return { created, skipped, claimed_by_others: claimed, errors };
 }
 
 export async function pushToTrello(

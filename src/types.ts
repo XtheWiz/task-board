@@ -40,6 +40,7 @@ export interface TrelloConfig {
   token: string;
   boardId: string;
   reviewList?: string;
+  claimedLabel?: string;
 }
 
 export interface ParsedCard {

@@ -198,7 +198,7 @@ export function registerTools(server: McpServer) {
       try {
         const result = await syncFromTrello();
         const lines = [
-          `Synced: ${result.created} new task(s) created, ${result.skipped} already synced`,
+          `Synced: ${result.created} new task(s) created, ${result.skipped} already synced, ${result.claimed_by_others} claimed by others`,
         ];
         if (result.errors.length > 0) {
           lines.push("Errors:", ...result.errors.map((e) => "  - " + e));
