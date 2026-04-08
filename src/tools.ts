@@ -33,6 +33,18 @@ export function registerTools(server: McpServer) {
       done_when: z
         .string()
         .describe("Explicit exit criteria — when is this task done?"),
+      depends_on: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Task IDs this task depends on — task won't be receivable until all dependencies are done",
+        ),
+      parent_task_id: z
+        .string()
+        .optional()
+        .describe(
+          "Parent task ID — links this task to a prior task for context chain",
+        ),
     },
     async (params) => {
       const task = db.createTask(params);
@@ -103,7 +115,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "complete_task",
-    "Mark a task as done with a completion summary",
+    "Mark a task as done with a completion summary and optional verdict",
     {
       task_id: z.string().describe("The task ID to complete"),
       summary: z
@@ -111,9 +123,15 @@ export function registerTools(server: McpServer) {
         .describe(
           "What was done — include file paths, commit hashes, key decisions",
         ),
+      verdict: z
+        .enum(["PASS", "FAIL", "PARTIAL", "BLOCKED"])
+        .optional()
+        .describe(
+          "Task outcome verdict (especially for QA tasks). PASS = all checks passed, FAIL = defects found, PARTIAL = some checks passed but gaps remain, BLOCKED = could not test",
+        ),
     },
-    async ({ task_id, summary }) => {
-      const task = db.completeTask(task_id, summary);
+    async ({ task_id, summary, verdict }) => {
+      const task = db.completeTask(task_id, summary, verdict);
       if (!task) {
         return {
           content: [
@@ -150,16 +168,22 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "list_tasks",
-    "List all tasks, optionally filtered by role and/or status",
+    "List all tasks, optionally filtered by role and/or status. Done tasks older than 30 days are auto-archived (hidden) unless include_archived is true.",
     {
       role: z.string().optional().describe("Filter by role"),
       status: z
         .enum(["pending", "in_progress", "done", "blocked"])
         .optional()
         .describe("Filter by status"),
+      include_archived: z
+        .boolean()
+        .optional()
+        .describe(
+          "Include done tasks older than 30 days (default: false, they are hidden)",
+        ),
     },
-    async ({ role, status }) => {
-      const tasks = db.listTasks(role, status);
+    async ({ role, status, include_archived }) => {
+      const tasks = db.listTasks(role, status, include_archived);
       if (tasks.length === 0) {
         const filters = [role && `role=${role}`, status && `status=${status}`]
           .filter(Boolean)
@@ -178,6 +202,9 @@ export function registerTools(server: McpServer) {
         role: t.role,
         title: t.title,
         status: t.status,
+        verdict: t.verdict,
+        depends_on: t.depends_on,
+        parent_task_id: t.parent_task_id,
         assigned_at: t.assigned_at,
         completed_at: t.completed_at,
         summary: t.summary,
@@ -243,6 +270,123 @@ export function registerTools(server: McpServer) {
           ],
         };
       }
+    },
+  );
+
+  // --- Template tools ---
+
+  server.tool(
+    "save_template",
+    "Save a reusable task template (e.g., 'qa-retest', 'qa2-real-device'). Templates auto-populate scope, constraints, and done_when when creating tasks.",
+    {
+      name: z
+        .string()
+        .describe(
+          "Unique template name (e.g., 'qa-retest', 'qa2-real-device', 'devteam-bugfix')",
+        ),
+      role: z.string().describe("Role this template creates tasks for"),
+      title_template: z
+        .string()
+        .describe(
+          "Title template — use {suffix} as placeholder for dynamic part",
+        ),
+      description_template: z
+        .string()
+        .optional()
+        .describe("Description template"),
+      scope: z.array(z.string()).optional().describe("Default scope items"),
+      constraints: z
+        .object({
+          must: z.array(z.string()).optional(),
+          must_not: z.array(z.string()).optional(),
+        })
+        .optional()
+        .describe("Default constraints"),
+      done_when: z.string().describe("Default exit criteria"),
+    },
+    async (params) => {
+      const template = db.saveTemplate({
+        id: params.name,
+        ...params,
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `Template '${template.name}' saved.\n${JSON.stringify(template, null, 2)}`,
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "create_from_template",
+    "Create a task from a saved template, optionally linking to a parent task (inherits context_files from parent).",
+    {
+      template: z.string().describe("Template name (e.g., 'qa-retest')"),
+      parent_task_id: z
+        .string()
+        .optional()
+        .describe(
+          "Parent task ID — inherits context_files and links for traceability",
+        ),
+      title_suffix: z
+        .string()
+        .optional()
+        .describe("Replaces {suffix} in the title template"),
+    },
+    async ({ template, parent_task_id, title_suffix }) => {
+      const task = db.createTaskFromTemplate(
+        template,
+        parent_task_id,
+        title_suffix,
+      );
+      if (!task) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Template not found: '${template}'. Use list_templates to see available templates.`,
+            },
+          ],
+        };
+      }
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(task, null, 2) },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "list_templates",
+    "List all saved task templates",
+    {},
+    async () => {
+      const templates = db.listTemplates();
+      if (templates.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "No templates saved. Use save_template to create one.",
+            },
+          ],
+        };
+      }
+      const summary = templates.map((t) => ({
+        name: t.name,
+        role: t.role,
+        title: t.title_template,
+        done_when: t.done_when,
+      }));
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(summary, null, 2) },
+        ],
+      };
     },
   );
 }

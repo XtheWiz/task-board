@@ -3,8 +3,10 @@ import { randomUUIDv7 } from "bun";
 import type {
   Task,
   TaskStatus,
+  TaskVerdict,
   TaskUpdate as TaskUpdateType,
   CreateTaskInput,
+  TaskTemplate,
 } from "./types.ts";
 
 const DB_PATH = process.env["TASKBOARD_DB"] || "taskboard.db";
@@ -40,13 +42,33 @@ export function getDb(): Database {
         value TEXT
       )
     `);
-    // Migrate existing DBs — add Trello columns if missing
-    try {
-      db.exec("ALTER TABLE tasks ADD COLUMN trello_card_id TEXT");
-    } catch {}
-    try {
-      db.exec("ALTER TABLE tasks ADD COLUMN trello_board_id TEXT");
-    } catch {}
+    // Migrate existing DBs — add columns if missing
+    const migrations = [
+      "ALTER TABLE tasks ADD COLUMN trello_card_id TEXT",
+      "ALTER TABLE tasks ADD COLUMN trello_board_id TEXT",
+      "ALTER TABLE tasks ADD COLUMN verdict TEXT",
+      "ALTER TABLE tasks ADD COLUMN depends_on TEXT",
+      "ALTER TABLE tasks ADD COLUMN parent_task_id TEXT",
+    ];
+    for (const sql of migrations) {
+      try {
+        db.exec(sql);
+      } catch {}
+    }
+
+    // Templates table
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS templates (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL UNIQUE,
+        role TEXT NOT NULL,
+        title_template TEXT NOT NULL,
+        description_template TEXT,
+        scope TEXT,
+        constraints TEXT,
+        done_when TEXT NOT NULL
+      )
+    `);
   }
   return db;
 }
@@ -66,6 +88,9 @@ function rowToTask(row: Record<string, unknown>): Task {
     completed_at: row["completed_at"] as string | undefined,
     summary: row["summary"] as string | undefined,
     updates: parseJson(row["updates"] as string | null) ?? [],
+    verdict: (row["verdict"] as TaskVerdict) || undefined,
+    depends_on: parseJson(row["depends_on"] as string | null),
+    parent_task_id: (row["parent_task_id"] as string) || undefined,
     trello_card_id: (row["trello_card_id"] as string) || undefined,
     trello_board_id: (row["trello_board_id"] as string) || undefined,
   };
@@ -83,8 +108,8 @@ function parseJson<T>(value: string | null): T | undefined {
 export function createTask(input: CreateTaskInput): Task {
   const id = randomUUIDv7();
   const stmt = getDb().prepare(`
-    INSERT INTO tasks (id, role, title, description, scope, context_files, constraints, done_when, trello_card_id, trello_board_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tasks (id, role, title, description, scope, context_files, constraints, done_when, depends_on, parent_task_id, trello_card_id, trello_board_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     id,
@@ -95,6 +120,8 @@ export function createTask(input: CreateTaskInput): Task {
     input.context_files ? JSON.stringify(input.context_files) : null,
     input.constraints ? JSON.stringify(input.constraints) : null,
     input.done_when,
+    input.depends_on ? JSON.stringify(input.depends_on) : null,
+    input.parent_task_id ?? null,
     input.trello_card_id ?? null,
     input.trello_board_id ?? null,
   );
@@ -109,20 +136,26 @@ export function getTask(id: string): Task | null {
 }
 
 export function receiveTask(role: string): Task | null {
-  const row = getDb()
+  // Get all pending/in_progress tasks for this role, ordered by assignment time
+  const rows = getDb()
     .prepare(
-      "SELECT * FROM tasks WHERE role = ? AND status IN ('pending', 'in_progress') ORDER BY assigned_at ASC LIMIT 1",
+      "SELECT * FROM tasks WHERE role = ? AND status IN ('pending', 'in_progress') ORDER BY assigned_at ASC",
     )
-    .get(role.toLowerCase()) as Record<string, unknown> | null;
-  if (!row) return null;
-  const task = rowToTask(row);
-  if (task.status === "pending") {
-    getDb()
-      .prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?")
-      .run(task.id);
-    task.status = "in_progress";
+    .all(role.toLowerCase()) as Record<string, unknown>[];
+
+  for (const row of rows) {
+    const task = rowToTask(row);
+    // Skip tasks with unmet dependencies
+    if (!areDependenciesMet(task)) continue;
+    if (task.status === "pending") {
+      getDb()
+        .prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?")
+        .run(task.id);
+      task.status = "in_progress";
+    }
+    return task;
   }
-  return task;
+  return null;
 }
 
 export function updateTask(
@@ -148,20 +181,36 @@ export function updateTask(
   return getTask(id);
 }
 
-export function completeTask(id: string, summary: string): Task | null {
+export function completeTask(
+  id: string,
+  summary: string,
+  verdict?: TaskVerdict,
+): Task | null {
   const task = getTask(id);
   if (!task) return null;
 
-  getDb()
-    .prepare(
-      "UPDATE tasks SET status = 'done', completed_at = datetime('now'), summary = ? WHERE id = ?",
-    )
-    .run(summary, id);
+  if (verdict) {
+    getDb()
+      .prepare(
+        "UPDATE tasks SET status = 'done', completed_at = datetime('now'), summary = ?, verdict = ? WHERE id = ?",
+      )
+      .run(summary, verdict, id);
+  } else {
+    getDb()
+      .prepare(
+        "UPDATE tasks SET status = 'done', completed_at = datetime('now'), summary = ? WHERE id = ?",
+      )
+      .run(summary, id);
+  }
 
   return getTask(id);
 }
 
-export function listTasks(role?: string, status?: TaskStatus): Task[] {
+export function listTasks(
+  role?: string,
+  status?: TaskStatus,
+  includeArchived?: boolean,
+): Task[] {
   let query = "SELECT * FROM tasks";
   const conditions: string[] = [];
   const params: string[] = [];
@@ -175,6 +224,13 @@ export function listTasks(role?: string, status?: TaskStatus): Task[] {
     params.push(status);
   }
 
+  // Auto-archive: exclude done tasks older than 30 days unless requested
+  if (!includeArchived && status !== "done") {
+    conditions.push(
+      "(status != 'done' OR completed_at > datetime('now', '-30 days'))",
+    );
+  }
+
   if (conditions.length > 0) {
     query += " WHERE " + conditions.join(" AND ");
   }
@@ -184,6 +240,125 @@ export function listTasks(role?: string, status?: TaskStatus): Task[] {
     .prepare(query)
     .all(...params) as Record<string, unknown>[];
   return rows.map(rowToTask);
+}
+
+/** Check if all dependencies of a task are done */
+export function areDependenciesMet(task: Task): boolean {
+  if (!task.depends_on || task.depends_on.length === 0) return true;
+  for (const depId of task.depends_on) {
+    const dep = getTask(depId);
+    if (!dep || dep.status !== "done") return false;
+  }
+  return true;
+}
+
+/** Get unblocked dependency info for a task */
+export function getDependencyStatus(task: Task): {
+  met: boolean;
+  blocking: string[];
+} {
+  if (!task.depends_on || task.depends_on.length === 0) {
+    return { met: true, blocking: [] };
+  }
+  const blocking: string[] = [];
+  for (const depId of task.depends_on) {
+    const dep = getTask(depId);
+    if (!dep || dep.status !== "done") {
+      blocking.push(depId);
+    }
+  }
+  return { met: blocking.length === 0, blocking };
+}
+
+// --- Template functions ---
+
+export function saveTemplate(template: TaskTemplate): TaskTemplate {
+  const stmt = getDb().prepare(`
+    INSERT OR REPLACE INTO templates (id, name, role, title_template, description_template, scope, constraints, done_when)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  stmt.run(
+    template.id,
+    template.name,
+    template.role,
+    template.title_template,
+    template.description_template ?? null,
+    template.scope ? JSON.stringify(template.scope) : null,
+    template.constraints ? JSON.stringify(template.constraints) : null,
+    template.done_when,
+  );
+  return template;
+}
+
+export function getTemplate(name: string): TaskTemplate | null {
+  const row = getDb()
+    .prepare("SELECT * FROM templates WHERE name = ?")
+    .get(name) as Record<string, unknown> | null;
+  if (!row) return null;
+  return {
+    id: row["id"] as string,
+    name: row["name"] as string,
+    role: row["role"] as string,
+    title_template: row["title_template"] as string,
+    description_template: row["description_template"] as string | undefined,
+    scope: parseJson(row["scope"] as string | null),
+    constraints: parseJson(row["constraints"] as string | null),
+    done_when: row["done_when"] as string,
+  };
+}
+
+export function listTemplates(): TaskTemplate[] {
+  const rows = getDb()
+    .prepare("SELECT * FROM templates ORDER BY name")
+    .all() as Record<string, unknown>[];
+  return rows.map((row) => ({
+    id: row["id"] as string,
+    name: row["name"] as string,
+    role: row["role"] as string,
+    title_template: row["title_template"] as string,
+    description_template: row["description_template"] as string | undefined,
+    scope: parseJson(row["scope"] as string | null),
+    constraints: parseJson(row["constraints"] as string | null),
+    done_when: row["done_when"] as string,
+  }));
+}
+
+export function createTaskFromTemplate(
+  templateName: string,
+  parentTaskId?: string,
+  titleSuffix?: string,
+): Task | null {
+  const tmpl = getTemplate(templateName);
+  if (!tmpl) return null;
+
+  // Inherit context_files from parent if available
+  let contextFiles: string[] | undefined;
+  let description = tmpl.description_template;
+
+  if (parentTaskId) {
+    const parent = getTask(parentTaskId);
+    if (parent) {
+      contextFiles = parent.context_files;
+      // Prepend parent reference to description
+      const parentRef = `Parent task: ${parent.title} (${parentTaskId})\n\n`;
+      description = parentRef + (description ?? "");
+    }
+  }
+
+  const title = titleSuffix
+    ? tmpl.title_template.replace("{suffix}", titleSuffix)
+    : tmpl.title_template;
+
+  return createTask({
+    role: tmpl.role,
+    title,
+    description,
+    scope: tmpl.scope,
+    context_files: contextFiles,
+    constraints: tmpl.constraints,
+    done_when: tmpl.done_when,
+    parent_task_id: parentTaskId,
+  });
 }
 
 export function getSyncState(key: string): string | null {

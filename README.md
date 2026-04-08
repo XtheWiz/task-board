@@ -97,24 +97,95 @@ update_task({
 
 ### `complete_task`
 
-Mark a task as done with a summary of what was accomplished.
+Mark a task as done with a summary of what was accomplished. Optionally include a verdict for quality-gate workflows.
 
 ```
 complete_task({
   task_id: "abc-123",
-  summary: "Added sliding window rate limiter in src/middleware/rate-limit.ts. Applied to all /auth/* routes. Tests pass."
+  summary: "Added sliding window rate limiter in src/middleware/rate-limit.ts. Applied to all /auth/* routes. Tests pass.",
+  verdict: "PASS"
 })
 ```
 
+Verdict values: `PASS`, `FAIL`, `PARTIAL`, `BLOCKED`. Useful for QA tasks where downstream routing depends on the outcome. The verdict is stored and shown in `list_tasks` output.
+
 ### `list_tasks`
 
-See all tasks, optionally filtered by role and/or status.
+See all tasks, optionally filtered by role and/or status. Done tasks older than 30 days are auto-archived (hidden by default).
 
 ```
-list_tasks({})                              // All tasks
-list_tasks({ role: "backend" })             // Backend's tasks
-list_tasks({ status: "pending" })           // All pending
-list_tasks({ role: "qa", status: "done" })  // QA's completed tasks
+list_tasks({})                                          // Active + recent done
+list_tasks({ role: "backend" })                         // Backend's tasks
+list_tasks({ status: "pending" })                       // All pending
+list_tasks({ role: "qa", status: "done" })              // QA's completed tasks
+list_tasks({ include_archived: true })                  // Include tasks done 30+ days ago
+```
+
+## Task Dependencies
+
+Tasks can declare dependencies on other tasks. A dependent task won't be returned by `receive_task` until all its dependencies are done.
+
+```
+// Create a dev task
+create_task({
+  role: "backend",
+  title: "Fix auth middleware",
+  done_when: "401 errors resolved"
+})
+// → returns task with id "task-A"
+
+// Create a QA task that depends on the dev task
+create_task({
+  role: "qa",
+  title: "Retest auth flow",
+  done_when: "Auth flow verified on device",
+  depends_on: ["task-A"]
+})
+
+// QA calls receive_task — gets nothing (task-A not done yet)
+receive_task({ role: "qa" })
+// → "No pending tasks for role: qa"
+
+// After backend completes task-A, QA can now receive the retest task
+receive_task({ role: "qa" })
+// → returns the retest task
+```
+
+## Task Templates
+
+Save reusable task templates to avoid repeating the same scope, constraints, and done_when for recurring task types (e.g., QA retests, bug fixes, code reviews).
+
+### `save_template`
+
+```
+save_template({
+  name: "qa-retest",
+  role: "qa",
+  title_template: "QA: Retest {suffix}",
+  scope: ["Verify fix on device", "Screenshot proof for each step"],
+  constraints: { must: ["Use production environment"], must_not: ["Skip screenshot proof"] },
+  done_when: "All fixes verified with screenshots"
+})
+```
+
+### `create_from_template`
+
+Create a task from a template. Optionally link to a parent task — `context_files` are inherited automatically.
+
+```
+create_from_template({
+  template: "qa-retest",
+  parent_task_id: "task-A",
+  title_suffix: "auth middleware fix"
+})
+// → Creates "QA: Retest auth middleware fix" with parent's context_files
+```
+
+### `list_templates`
+
+```
+list_templates({})
+// → [{ name: "qa-retest", role: "qa", title: "QA: Retest {suffix}", ... }]
 ```
 
 ## Workflow Example
@@ -131,6 +202,22 @@ Backend session:
 
 Coordinator session:
   → list_tasks()                     // Sees all tasks with statuses
+```
+
+### Pipeline workflow with dependencies
+
+```
+Coordinator:
+  → dev_task = create_task(role: "backend", title: "Fix bug", ...)
+  → create_task(role: "qa", title: "Retest fix", depends_on: [dev_task.id], ...)
+
+Backend:
+  → receive_task(role: "backend")    // Gets fix task
+  → complete_task(task_id, summary: "Fixed", verdict: "PASS")
+
+QA (auto-unblocked):
+  → receive_task(role: "qa")         // Now available — dependency met
+  → complete_task(task_id, summary: "Verified", verdict: "PASS")
 ```
 
 ## Trello Integration
@@ -223,15 +310,16 @@ push_trello({ task_id: "abc-123" })
 ## Task Lifecycle
 
 ```
-pending → in_progress → done
+pending → in_progress → done (with optional verdict)
                 ↓
              blocked
 ```
 
 - Tasks are created as `pending`
-- `receive_task` automatically transitions to `in_progress`
+- `receive_task` automatically transitions to `in_progress` (skips tasks with unmet dependencies)
 - Agents can mark tasks as `blocked` with a reason
-- `complete_task` marks as `done` with a summary
+- `complete_task` marks as `done` with a summary and optional verdict (`PASS`/`FAIL`/`PARTIAL`/`BLOCKED`)
+- Done tasks older than 30 days are auto-archived (hidden from `list_tasks` by default)
 
 ## Configuration
 
@@ -242,6 +330,26 @@ pending → in_progress → done
 | `TRELLO_TOKEN`       | —              | Trello user token with read/write access    |
 | `TRELLO_BOARD_ID`    | —              | Trello board ID to sync                     |
 | `TRELLO_REVIEW_LIST` | `Review`       | Name of the Trello list for completed tasks |
+
+## Changelog
+
+### v0.3.0
+
+- **Verdict on complete_task** — optional `verdict` field (`PASS`/`FAIL`/`PARTIAL`/`BLOCKED`) for quality-gate workflows. Stored in DB, visible in `list_tasks`.
+- **Task dependencies** — `depends_on` field on `create_task`. Tasks with unmet dependencies are skipped by `receive_task` until all dependencies are done.
+- **Task templates** — `save_template`, `create_from_template`, `list_templates` tools. Define reusable task shapes with `{suffix}` placeholders. Templates inherit `context_files` from parent tasks for traceability.
+- **Auto-archive** — `list_tasks` hides done tasks older than 30 days by default. Use `include_archived: true` to see everything.
+- **Parent task linking** — `parent_task_id` field on `create_task` links related tasks for context chain (e.g., a QA retest linked to the dev fix it's verifying).
+
+### v0.2.0
+
+- Trello integration (`sync_trello`, `push_trello`)
+- Auto-push to Trello on `complete_task` for linked cards
+- Smart description parsing from Trello card content
+
+### v0.1.0
+
+- Initial release — `create_task`, `receive_task`, `update_task`, `complete_task`, `list_tasks`
 
 ## License
 
