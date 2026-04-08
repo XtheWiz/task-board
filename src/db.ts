@@ -7,6 +7,7 @@ import type {
   TaskUpdate as TaskUpdateType,
   CreateTaskInput,
   TaskTemplate,
+  TaskMetrics,
 } from "./types.ts";
 
 const DB_PATH = process.env["TASKBOARD_DB"] || "taskboard.db";
@@ -379,4 +380,132 @@ export function findTaskByTrelloCard(cardId: string): Task | null {
     .prepare("SELECT * FROM tasks WHERE trello_card_id = ?")
     .get(cardId) as Record<string, unknown> | null;
   return row ? rowToTask(row) : null;
+}
+
+// --- Metrics ---
+
+export function getMetrics(role?: string, days: number = 30): TaskMetrics {
+  const d = getDb();
+  const dateFilter = `datetime('now', '-${days} days')`;
+
+  // Role filter helper
+  const roleWhere = role ? ` AND role = '${role.toLowerCase()}'` : "";
+
+  // 1. Cycle time per role (avg minutes from assigned to completed)
+  const cycleRows = d
+    .prepare(
+      `SELECT role,
+        ROUND(AVG((julianday(completed_at) - julianday(assigned_at)) * 24 * 60)) as avg_minutes,
+        COUNT(*) as count
+      FROM tasks
+      WHERE status = 'done' AND completed_at IS NOT NULL
+        AND assigned_at > ${dateFilter}${roleWhere}
+      GROUP BY role ORDER BY avg_minutes DESC`,
+    )
+    .all() as { role: string; avg_minutes: number; count: number }[];
+
+  // 2. Rejection rate per role (verdict breakdown)
+  const rejectionRows = d
+    .prepare(
+      `SELECT role,
+        COUNT(*) as total,
+        SUM(CASE WHEN verdict = 'PASS' THEN 1 ELSE 0 END) as pass,
+        SUM(CASE WHEN verdict = 'FAIL' THEN 1 ELSE 0 END) as fail,
+        SUM(CASE WHEN verdict = 'PARTIAL' THEN 1 ELSE 0 END) as partial,
+        SUM(CASE WHEN verdict = 'BLOCKED' THEN 1 ELSE 0 END) as blocked,
+        SUM(CASE WHEN verdict IS NULL THEN 1 ELSE 0 END) as no_verdict
+      FROM tasks
+      WHERE status = 'done'
+        AND assigned_at > ${dateFilter}${roleWhere}
+      GROUP BY role ORDER BY role`,
+    )
+    .all() as {
+    role: string;
+    total: number;
+    pass: number;
+    fail: number;
+    partial: number;
+    blocked: number;
+    no_verdict: number;
+  }[];
+
+  // 3. Verdict distribution (totals)
+  const verdictRow = d
+    .prepare(
+      `SELECT
+        SUM(CASE WHEN verdict = 'PASS' THEN 1 ELSE 0 END) as pass,
+        SUM(CASE WHEN verdict = 'FAIL' THEN 1 ELSE 0 END) as fail,
+        SUM(CASE WHEN verdict = 'PARTIAL' THEN 1 ELSE 0 END) as partial,
+        SUM(CASE WHEN verdict = 'BLOCKED' THEN 1 ELSE 0 END) as blocked,
+        SUM(CASE WHEN verdict IS NULL THEN 1 ELSE 0 END) as none
+      FROM tasks
+      WHERE status = 'done'
+        AND assigned_at > ${dateFilter}${roleWhere}`,
+    )
+    .get() as {
+    pass: number;
+    fail: number;
+    partial: number;
+    blocked: number;
+    none: number;
+  };
+
+  // 4. Throughput (tasks completed per day)
+  const throughputRows = d
+    .prepare(
+      `SELECT DATE(completed_at) as date, COUNT(*) as count
+      FROM tasks
+      WHERE status = 'done' AND completed_at IS NOT NULL
+        AND completed_at > ${dateFilter}${roleWhere}
+      GROUP BY DATE(completed_at)
+      ORDER BY date DESC`,
+    )
+    .all() as { date: string; count: number }[];
+
+  // 5. Total tasks in period
+  const totalRow = d
+    .prepare(
+      `SELECT COUNT(*) as total FROM tasks
+      WHERE assigned_at > ${dateFilter}${roleWhere}`,
+    )
+    .get() as { total: number };
+
+  // 6. Average fix loops (tasks sharing same parent chain)
+  const parentRows = d
+    .prepare(
+      `SELECT parent_task_id, COUNT(*) as chain_length
+      FROM tasks
+      WHERE parent_task_id IS NOT NULL
+        AND assigned_at > ${dateFilter}${roleWhere}
+      GROUP BY parent_task_id`,
+    )
+    .all() as { parent_task_id: string; chain_length: number }[];
+
+  const avgFixLoops =
+    parentRows.length > 0
+      ? parentRows.reduce((sum, r) => sum + r.chain_length, 0) /
+        parentRows.length
+      : 0;
+
+  // Tasks per day
+  const activeDays = throughputRows.length || 1;
+  const totalCompleted = throughputRows.reduce((s, r) => s + r.count, 0);
+  const tasksPerDay = Math.round((totalCompleted / activeDays) * 10) / 10;
+
+  return {
+    period_days: days,
+    total_tasks: totalRow.total,
+    cycle_time: cycleRows,
+    rejection_rate: rejectionRows,
+    verdict_distribution: {
+      PASS: verdictRow?.pass ?? 0,
+      FAIL: verdictRow?.fail ?? 0,
+      PARTIAL: verdictRow?.partial ?? 0,
+      BLOCKED: verdictRow?.blocked ?? 0,
+      none: verdictRow?.none ?? 0,
+    },
+    throughput: throughputRows,
+    avg_fix_loops: Math.round(avgFixLoops * 10) / 10,
+    tasks_per_day: tasksPerDay,
+  };
 }

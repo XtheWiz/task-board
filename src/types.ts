@@ -69,6 +69,31 @@ export interface CompleteTaskInput {
   verdict?: TaskVerdict;
 }
 
+export interface TaskMetrics {
+  period_days: number;
+  total_tasks: number;
+  cycle_time: { role: string; avg_minutes: number; count: number }[];
+  rejection_rate: {
+    role: string;
+    total: number;
+    pass: number;
+    fail: number;
+    partial: number;
+    blocked: number;
+    no_verdict: number;
+  }[];
+  verdict_distribution: {
+    PASS: number;
+    FAIL: number;
+    PARTIAL: number;
+    BLOCKED: number;
+    none: number;
+  };
+  throughput: { date: string; count: number }[];
+  avg_fix_loops: number;
+  tasks_per_day: number;
+}
+
 export interface TaskTemplate {
   id: string;
   name: string;

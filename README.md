@@ -321,6 +321,51 @@ pending → in_progress → done (with optional verdict)
 - `complete_task` marks as `done` with a summary and optional verdict (`PASS`/`FAIL`/`PARTIAL`/`BLOCKED`)
 - Done tasks older than 30 days are auto-archived (hidden from `list_tasks` by default)
 
+## Metrics
+
+Get computed stats from your task history — cycle time, rejection rates, throughput, and fix loop analysis. All derived from existing task data, no extra tracking required.
+
+### `task_metrics`
+
+```
+task_metrics({})                    // Full dashboard (last 30 days)
+task_metrics({ role: "qa" })        // QA-specific stats
+task_metrics({ days: 7 })           // Last 7 days only
+```
+
+Example output:
+
+```
+=== Task Metrics (last 30 days) ===
+Total tasks: 69
+Throughput: 8.5 tasks/day (8 active days)
+
+Cycle time (avg):
+  devteam: 1h 42m (12 tasks)
+  qa: 38m (8 tasks)
+  qa2: 44m (5 tasks)
+
+Verdict breakdown by role:
+  devteam: 10P 0F 0PT 0BL 2? (0% non-pass)
+  qa: 5P 0F 2PT 1BL 0? (38% non-pass)
+  qa2: 1P 0F 0PT 3BL 1? (60% non-pass)
+
+Verdict totals: PASS:16 FAIL:0 PARTIAL:2 BLOCKED:4 none:3
+
+Avg fix loops: 2.3 rounds per parent task
+
+Daily throughput (last 7 days):
+  2026-04-08: 12 tasks
+  2026-04-07: 10 tasks
+```
+
+**What each metric tells you:**
+
+- **Cycle time** — which roles are fast/slow? Is QA bottlenecked?
+- **Rejection rate** — "QA rejects 40% of DevTeam work" → systemic quality issue
+- **Fix loops** — how many rounds does it take to get to PASS? High = fix quality problem
+- **Throughput** — are you speeding up or slowing down?
+
 ## Configuration
 
 | Environment Variable | Default        | Description                                 |
@@ -332,6 +377,10 @@ pending → in_progress → done (with optional verdict)
 | `TRELLO_REVIEW_LIST` | `Review`       | Name of the Trello list for completed tasks |
 
 ## Changelog
+
+### v0.3.1
+
+- **Task metrics** — `task_metrics` tool computes cycle time per role, rejection rates, verdict distribution, daily throughput, and fix loop analysis from existing task data. Filter by role or time period.
 
 ### v0.3.0
 

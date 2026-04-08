@@ -389,4 +389,86 @@ export function registerTools(server: McpServer) {
       };
     },
   );
+
+  // --- Metrics ---
+
+  server.tool(
+    "task_metrics",
+    "Get task board metrics: cycle time per role, rejection rate, verdict distribution, throughput, and fix loop stats. All computed from existing task data.",
+    {
+      role: z.string().optional().describe("Filter metrics to a specific role"),
+      days: z
+        .number()
+        .optional()
+        .describe("Number of days to analyze (default: 30)"),
+    },
+    async ({ role, days }) => {
+      const metrics = db.getMetrics(role, days ?? 30);
+
+      // Format human-readable summary
+      const lines: string[] = [];
+      lines.push(
+        `=== Task Metrics (last ${metrics.period_days} days${role ? `, role: ${role}` : ""}) ===`,
+      );
+      lines.push(`Total tasks: ${metrics.total_tasks}`);
+      lines.push(
+        `Throughput: ${metrics.tasks_per_day} tasks/day (${metrics.throughput.length} active days)`,
+      );
+      lines.push("");
+
+      // Cycle time
+      lines.push("Cycle time (avg):");
+      if (metrics.cycle_time.length === 0) {
+        lines.push("  No completed tasks in period");
+      }
+      for (const ct of metrics.cycle_time) {
+        const hours = Math.floor(ct.avg_minutes / 60);
+        const mins = Math.round(ct.avg_minutes % 60);
+        const display = hours > 0 ? `${hours}h ${mins}m` : `${mins}m`;
+        lines.push(`  ${ct.role}: ${display} (${ct.count} tasks)`);
+      }
+      lines.push("");
+
+      // Rejection rate
+      lines.push("Verdict breakdown by role:");
+      for (const r of metrics.rejection_rate) {
+        const rejectPct =
+          r.total > 0
+            ? Math.round(((r.fail + r.partial + r.blocked) / r.total) * 100)
+            : 0;
+        lines.push(
+          `  ${r.role}: ${r.pass}P ${r.fail}F ${r.partial}PT ${r.blocked}BL ${r.no_verdict}? (${rejectPct}% non-pass)`,
+        );
+      }
+      lines.push("");
+
+      // Verdict totals
+      const v = metrics.verdict_distribution;
+      lines.push(
+        `Verdict totals: PASS:${v.PASS} FAIL:${v.FAIL} PARTIAL:${v.PARTIAL} BLOCKED:${v.BLOCKED} none:${v.none}`,
+      );
+      lines.push("");
+
+      // Fix loops
+      if (metrics.avg_fix_loops > 0) {
+        lines.push(
+          `Avg fix loops: ${metrics.avg_fix_loops} rounds per parent task`,
+        );
+      }
+
+      // Daily throughput (last 7 days)
+      const recent = metrics.throughput.slice(0, 7);
+      if (recent.length > 0) {
+        lines.push("");
+        lines.push("Daily throughput (last 7 days):");
+        for (const d of recent) {
+          lines.push(`  ${d.date}: ${d.count} tasks`);
+        }
+      }
+
+      return {
+        content: [{ type: "text" as const, text: lines.join("\n") }],
+      };
+    },
+  );
 }

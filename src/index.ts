@@ -5,7 +5,7 @@ import { registerTools } from "./tools.ts";
 
 const server = new McpServer({
   name: "task-board",
-  version: "0.3.0",
+  version: "0.3.1",
 });
 
 registerTools(server);
