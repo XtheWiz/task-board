@@ -376,7 +376,94 @@ Daily throughput (last 7 days):
 | `TRELLO_BOARD_ID`    | —              | Trello board ID to sync                     |
 | `TRELLO_REVIEW_LIST` | `Review`       | Name of the Trello list for completed tasks |
 
+## Bulletin Board (v0.4)
+
+Tasks are now threaded conversations, not one-shot assignments. Any agent can post typed updates on any task, turning each task into a mini bulletin board.
+
+### Typed updates
+
+Updates now carry a `type` and `from` field:
+
+```
+update_task({
+  task_id: "abc-123",
+  type: "question",
+  from: "devteam",
+  message: "Should Follow be gated to Plus or Pro?"
+})
+
+update_task({
+  task_id: "abc-123",
+  type: "answer",
+  from: "po",
+  message: "Plus. Follow is a Plus feature, Smart Alerts is Pro."
+})
+```
+
+| Type       | Use for                                     |
+| ---------- | ------------------------------------------- |
+| `progress` | Status updates ("middleware done, testing") |
+| `question` | Needs a decision from another role          |
+| `answer`   | Resolves a previous question                |
+| `finding`  | Discovery during work ("found a bug here")  |
+| `blocker`  | Can't proceed without external resolution   |
+
+### Cross-agent posting
+
+Any agent can post on any task — not just the assigned role. UXUI can add design notes to a DevTeam task. QA can post findings on a dev task. PO can answer questions inline.
+
+### `list_questions`
+
+See all tasks with unanswered questions. PO runs this to find pending decisions.
+
+```
+list_questions({})                // All unresolved questions
+list_questions({ role: "devteam" })  // Questions on DevTeam tasks only
+```
+
+Example output:
+
+```json
+[
+  {
+    "task_id": "abc-123",
+    "task_title": "Implement Passport feature",
+    "role": "devteam",
+    "unanswered": 1,
+    "latest_question": "Should Follow be gated to Plus or Pro?",
+    "asked_by": "devteam"
+  }
+]
+```
+
+### `list_subtasks`
+
+See all subtasks of a parent task with progress rollup.
+
+```
+list_subtasks({ parent_task_id: "abc-123" })
+// → "Implement Passport — 2/4 subtasks done"
+```
+
+### Workflow example
+
+```
+PO creates task → DevTeam receives it
+DevTeam posts:   update_task(type: "question", from: "devteam", "Should X be Plus or Pro?")
+PO checks:       list_questions()  → sees the pending question
+PO answers:      update_task(type: "answer", from: "po", "Plus. See PRODUCT_SPEC.md §Feature Matrix")
+DevTeam checks:  receive_task()  → sees the answer in updates array
+Full thread preserved on the task — no context lost between sessions
+```
+
 ## Changelog
+
+### v0.4.0
+
+- **Typed updates** — `update_task` now accepts `type` (`progress`/`question`/`answer`/`finding`/`blocker`) and `from` (role name) fields. Updates are categorized and attributed.
+- **Cross-agent posting** — any agent can post on any task, enabling threaded conversations between roles.
+- **`list_questions`** — new tool to find tasks with unanswered questions. Tracks question/answer pairs — a question is "resolved" when followed by an answer.
+- **`list_subtasks`** — new tool to list subtasks of a parent task with progress rollup ("2/4 done").
 
 ### v0.3.1
 

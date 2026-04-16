@@ -87,17 +87,29 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "update_task",
-    "Post a progress update or change task status",
+    "Post a typed update on any task. Use type to categorize: 'question' for decisions needed, 'answer' to resolve a question, 'progress' for status updates, 'finding' for discoveries, 'blocker' for impediments. Any agent can post on any task (cross-agent).",
     {
       task_id: z.string().describe("The task ID to update"),
       status: z
         .enum(["pending", "in_progress", "blocked"])
         .optional()
         .describe("New status"),
-      message: z.string().optional().describe("Progress update message"),
+      message: z.string().optional().describe("Update message"),
+      type: z
+        .enum(["progress", "question", "answer", "finding", "blocker"])
+        .optional()
+        .describe(
+          "Update type — question: needs decision, answer: resolves a question, progress: status update, finding: discovery, blocker: impediment",
+        ),
+      from: z
+        .string()
+        .optional()
+        .describe(
+          "Role posting this update (e.g. 'devteam', 'po', 'qa') — enables cross-agent communication",
+        ),
     },
-    async ({ task_id, status, message }) => {
-      const task = db.updateTask(task_id, status, message);
+    async ({ task_id, status, message, type, from }) => {
+      const task = db.updateTask(task_id, status, message, type, from);
       if (!task) {
         return {
           content: [
@@ -468,6 +480,107 @@ export function registerTools(server: McpServer) {
 
       return {
         content: [{ type: "text" as const, text: lines.join("\n") }],
+      };
+    },
+  );
+
+  // --- Subtasks ---
+
+  server.tool(
+    "list_subtasks",
+    "List all subtasks of a parent task. Shows progress rollup (e.g. '2/4 done').",
+    {
+      parent_task_id: z
+        .string()
+        .describe("The parent task ID to list subtasks for"),
+    },
+    async ({ parent_task_id }) => {
+      const parent = db.getTask(parent_task_id);
+      if (!parent) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: "Parent task not found: " + parent_task_id,
+            },
+          ],
+        };
+      }
+      const subtasks = db.listSubtasks(parent_task_id);
+      if (subtasks.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Task "${parent.title}" has no subtasks.`,
+            },
+          ],
+        };
+      }
+      const done = subtasks.filter((t) => t.status === "done").length;
+      const summary = subtasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        role: t.role,
+        status: t.status,
+        verdict: t.verdict,
+      }));
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: `${parent.title} — ${done}/${subtasks.length} subtasks done\n\n${JSON.stringify(summary, null, 2)}`,
+          },
+        ],
+      };
+    },
+  );
+
+  // --- Unresolved questions ---
+
+  server.tool(
+    "list_questions",
+    "List tasks with unanswered questions. Use this to see what decisions are pending.",
+    {
+      role: z
+        .string()
+        .optional()
+        .describe("Filter to questions on tasks assigned to this role"),
+    },
+    async ({ role }) => {
+      const tasks = db.listTasksWithQuestions(role);
+      if (tasks.length === 0) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "No unresolved questions" + (role ? ` for role: ${role}` : ""),
+            },
+          ],
+        };
+      }
+      const summary = tasks.map((t) => {
+        const questions = (t.updates ?? []).filter(
+          (u) => u.type === "question",
+        );
+        const answers = (t.updates ?? []).filter((u) => u.type === "answer");
+        return {
+          task_id: t.id,
+          task_title: t.title,
+          role: t.role,
+          unanswered: questions.length - answers.length,
+          latest_question: questions[questions.length - 1]?.message,
+          asked_by: questions[questions.length - 1]?.from,
+        };
+      });
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(summary, null, 2),
+          },
+        ],
       };
     },
   );

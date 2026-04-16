@@ -5,6 +5,7 @@ import type {
   TaskStatus,
   TaskVerdict,
   TaskUpdate as TaskUpdateType,
+  UpdateType,
   CreateTaskInput,
   TaskTemplate,
   TaskMetrics,
@@ -163,6 +164,8 @@ export function updateTask(
   id: string,
   status?: TaskStatus,
   message?: string,
+  type?: UpdateType,
+  from?: string,
 ): Task | null {
   const task = getTask(id);
   if (!task) return null;
@@ -173,13 +176,46 @@ export function updateTask(
 
   if (message) {
     const updates: TaskUpdateType[] = task.updates ?? [];
-    updates.push({ timestamp: new Date().toISOString(), message });
+    const entry: TaskUpdateType = {
+      timestamp: new Date().toISOString(),
+      message,
+    };
+    if (type) entry.type = type;
+    if (from) entry.from = from;
+    updates.push(entry);
     getDb()
       .prepare("UPDATE tasks SET updates = ? WHERE id = ?")
       .run(JSON.stringify(updates), id);
   }
 
   return getTask(id);
+}
+
+/** List subtasks of a parent task */
+export function listSubtasks(parentId: string): Task[] {
+  const rows = getDb()
+    .prepare(
+      "SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY assigned_at ASC",
+    )
+    .all(parentId) as Record<string, unknown>[];
+  return rows.map(rowToTask);
+}
+
+/** Check if a task has unresolved questions (question without a following answer) */
+function hasUnresolvedQuestions(task: Task): boolean {
+  const updates = task.updates ?? [];
+  let unanswered = 0;
+  for (const u of updates) {
+    if (u.type === "question") unanswered++;
+    if (u.type === "answer") unanswered = Math.max(0, unanswered - 1);
+  }
+  return unanswered > 0;
+}
+
+/** List tasks that have unanswered questions */
+export function listTasksWithQuestions(role?: string): Task[] {
+  const tasks = listTasks(role, undefined, false);
+  return tasks.filter((t) => t.status !== "done" && hasUnresolvedQuestions(t));
 }
 
 export function completeTask(

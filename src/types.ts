@@ -22,9 +22,18 @@ export interface Task {
   trello_board_id?: string;
 }
 
+export type UpdateType =
+  | "progress"
+  | "question"
+  | "answer"
+  | "finding"
+  | "blocker";
+
 export interface TaskUpdate {
   timestamp: string;
   message: string;
+  type?: UpdateType;
+  from?: string;
 }
 
 export interface CreateTaskInput {
@@ -61,6 +70,8 @@ export interface UpdateTaskInput {
   task_id: string;
   status?: TaskStatus;
   message?: string;
+  type?: UpdateType;
+  from?: string;
 }
 
 export interface CompleteTaskInput {
