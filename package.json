@@ -1,6 +1,6 @@
 {
   "name": "@xthewiz/task-board",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "A lightweight MCP task board for AI agent teams",
   "module": "src/index.ts",
   "type": "module",

@@ -142,7 +142,7 @@ export function registerTools(server: McpServer) {
           "What was done — include file paths, commit hashes, key decisions",
         ),
       verdict: z
-        .enum(["PASS", "FAIL", "PARTIAL", "BLOCKED"])
+        .enum(["PASS", "FAIL", "PARTIAL", "BLOCKED", "CANCELLED"])
         .optional()
         .describe(
           "Task outcome verdict (especially for QA tasks). PASS = all checks passed, FAIL = defects found, PARTIAL = some checks passed but gaps remain, BLOCKED = could not test",
@@ -202,7 +202,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "list_tasks",
-    "List all tasks, optionally filtered by role and/or status. Done tasks older than 30 days are auto-archived (hidden) unless include_archived is true.",
+    "List tasks with optional filters and pagination. Returns tasks + total_count for pagination. Done tasks older than 30 days are auto-archived unless include_archived is true. Default limit: 50.",
     {
       role: z.string().optional().describe("Filter by role"),
       status: z
@@ -215,9 +215,33 @@ export function registerTools(server: McpServer) {
         .describe(
           "Include done tasks older than 30 days (default: false, they are hidden)",
         ),
+      limit: z
+        .number()
+        .optional()
+        .describe("Max tasks to return (default: 50)"),
+      offset: z
+        .number()
+        .optional()
+        .describe("Number of tasks to skip for pagination (default: 0)"),
+      since: z
+        .string()
+        .optional()
+        .describe("Filter tasks assigned at or after this ISO date"),
+      until: z
+        .string()
+        .optional()
+        .describe("Filter tasks completed at or before this ISO date"),
     },
-    async ({ role, status, include_archived }) => {
-      const tasks = db.listTasks(role, status, include_archived);
+    async ({ role, status, include_archived, limit, offset, since, until }) => {
+      const { tasks, total_count } = db.listTasks({
+        role,
+        status,
+        includeArchived: include_archived,
+        limit,
+        offset,
+        since,
+        until,
+      });
       if (tasks.length === 0) {
         const filters = [role && `role=${role}`, status && `status=${status}`]
           .filter(Boolean)
@@ -226,7 +250,7 @@ export function registerTools(server: McpServer) {
           content: [
             {
               type: "text" as const,
-              text: `No tasks found${filters ? ` (${filters})` : ""}`,
+              text: `No tasks found${filters ? ` (${filters})` : ""} (total_count: ${total_count})`,
             },
           ],
         };
@@ -245,7 +269,14 @@ export function registerTools(server: McpServer) {
       }));
       return {
         content: [
-          { type: "text" as const, text: JSON.stringify(summary, null, 2) },
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              { total_count, returned: tasks.length, tasks: summary },
+              null,
+              2,
+            ),
+          },
         ],
       };
     },
@@ -719,6 +750,185 @@ export function registerTools(server: McpServer) {
       return {
         content: [
           { type: "text" as const, text: JSON.stringify(summary, null, 2) },
+        ],
+      };
+    },
+  );
+
+  // --- v0.6 tools ---
+
+  server.tool(
+    "cancel_task",
+    "Cancel a task with a reason. Marks it done with verdict=CANCELLED. CANCELLED tasks are excluded from cycle-time and rejection-rate metrics.",
+    {
+      task_id: z.string().describe("The task ID to cancel"),
+      reason: z.string().describe("Why this task is being cancelled"),
+      cancelled_by: z
+        .string()
+        .optional()
+        .describe("Role or name of who is cancelling (e.g. 'po')"),
+    },
+    async ({ task_id, reason, cancelled_by }) => {
+      const result = db.cancelTask(task_id, reason, cancelled_by);
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${result.error}` }],
+        };
+      }
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "edit_task",
+    "Edit mutable fields on a pending or in_progress task. Appends an audit entry to edit_history. Cannot edit done tasks.",
+    {
+      task_id: z.string().describe("The task ID to edit"),
+      title: z.string().optional().describe("New title"),
+      description: z.string().optional().describe("New description"),
+      scope: z.array(z.string()).optional().describe("New scope list"),
+      constraints: z
+        .object({
+          must: z.array(z.string()).optional(),
+          must_not: z.array(z.string()).optional(),
+        })
+        .optional()
+        .describe("New constraints"),
+      done_when: z.string().optional().describe("New exit criteria"),
+      allow_self_pass: z
+        .boolean()
+        .optional()
+        .describe("Update allow_self_pass flag"),
+      edited_by: z
+        .string()
+        .optional()
+        .describe("Role making the edit, for audit trail (e.g. 'po')"),
+    },
+    async ({ task_id, edited_by, ...fields }) => {
+      const result = db.editTask(task_id, fields, edited_by);
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${result.error}` }],
+        };
+      }
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(result, null, 2) },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "bulk_create_tasks",
+    "Atomically create multiple tasks in one call. All tasks are created or none are (transaction). Useful for retro action items, sprint planning, or bulk setup.",
+    {
+      tasks: z
+        .array(
+          z.object({
+            role: z.string(),
+            title: z.string(),
+            description: z.string().optional(),
+            scope: z.array(z.string()).optional(),
+            context_files: z.array(z.string()).optional(),
+            constraints: z
+              .object({
+                must: z.array(z.string()).optional(),
+                must_not: z.array(z.string()).optional(),
+              })
+              .optional(),
+            done_when: z.string(),
+            depends_on: z.array(z.string()).optional(),
+            parent_task_id: z.string().optional(),
+            allow_self_pass: z.boolean().optional(),
+          }),
+        )
+        .describe("Array of tasks to create"),
+    },
+    async ({ tasks }) => {
+      const result = db.bulkCreateTasks(tasks);
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${result.error}` }],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                created: result.length,
+                tasks: result.map((t) => ({
+                  id: t.id,
+                  role: t.role,
+                  title: t.title,
+                })),
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "bulk_complete",
+    "Atomically complete multiple tasks in one call. All completions succeed or all roll back. Useful for closing a batch of related tasks at end of session.",
+    {
+      completions: z
+        .array(
+          z.object({
+            task_id: z.string(),
+            summary: z.string(),
+            verdict: z
+              .enum(["PASS", "FAIL", "PARTIAL", "BLOCKED", "CANCELLED"])
+              .optional(),
+            from: z.string().optional(),
+          }),
+        )
+        .describe("Array of task completions"),
+    },
+    async ({ completions }) => {
+      const result = db.bulkComplete(completions);
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${result.error}` }],
+        };
+      }
+      const succeeded = result.results.filter((r) => !("error" in r)).length;
+      const failed = result.results.filter((r) => "error" in r);
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                completed: succeeded,
+                errors: failed.length,
+                results: result.results.map((r) =>
+                  "error" in r
+                    ? {
+                        id: (r as { id: string }).id,
+                        error: (r as { error: string }).error,
+                      }
+                    : {
+                        id: (r as { id: string }).id,
+                        status: "done",
+                        verdict: (r as { verdict?: string }).verdict,
+                      },
+                ),
+              },
+              null,
+              2,
+            ),
+          },
         ],
       };
     },

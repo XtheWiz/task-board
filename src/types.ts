@@ -1,5 +1,12 @@
 export type TaskStatus = "pending" | "in_progress" | "done" | "blocked";
-export type TaskVerdict = "PASS" | "FAIL" | "PARTIAL" | "BLOCKED";
+export type TaskVerdict = "PASS" | "FAIL" | "PARTIAL" | "BLOCKED" | "CANCELLED";
+
+export interface EditHistoryEntry {
+  timestamp: string;
+  edited_by?: string;
+  fields_changed: string[];
+  prior_values: Record<string, unknown>;
+}
 
 export interface Task {
   id: string;
@@ -23,6 +30,7 @@ export interface Task {
   trello_card_url?: string;
   allow_self_pass?: boolean;
   claimed_by?: string;
+  edit_history?: EditHistoryEntry[];
 }
 
 export type UpdateType =
@@ -102,11 +110,27 @@ export interface TaskMetrics {
     FAIL: number;
     PARTIAL: number;
     BLOCKED: number;
+    CANCELLED: number;
     none: number;
   };
   throughput: { date: string; count: number }[];
   avg_fix_loops: number;
   tasks_per_day: number;
+}
+
+export interface ListTasksOptions {
+  role?: string;
+  status?: TaskStatus;
+  includeArchived?: boolean;
+  limit?: number;
+  offset?: number;
+  since?: string;
+  until?: string;
+}
+
+export interface ListTasksResult {
+  tasks: Task[];
+  total_count: number;
 }
 
 export interface TaskTemplate {

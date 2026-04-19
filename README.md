@@ -311,6 +311,91 @@ push_trello({ task_id: "abc-123" })
 // → "Card moved to Review with summary comment"
 ```
 
+## Pagination (v0.6)
+
+`list_tasks` now supports pagination and date filters. All parameters are optional — existing callers get the first 50 results by default.
+
+```
+list_tasks({ limit: 20, offset: 0 })                        // First page
+list_tasks({ limit: 20, offset: 20 })                       // Second page
+list_tasks({ role: "qa", status: "done", limit: 10 })       // Filtered + paginated
+list_tasks({ since: "2026-04-01", until: "2026-04-19" })    // Date range
+```
+
+Response includes `total_count` for pagination UI:
+
+```json
+{
+  "total_count": 84,
+  "returned": 20,
+  "tasks": [...]
+}
+```
+
+## Cancellation (v0.6)
+
+Mark tasks intentionally skipped with `cancel_task`. CANCELLED tasks are excluded from cycle-time and rejection-rate metrics — they represent scope changes, not work quality.
+
+```
+cancel_task({
+  task_id: "abc-123",
+  reason: "Feature cut from scope — not needed for launch",
+  cancelled_by: "po"
+})
+```
+
+Alternatively set `verdict: "CANCELLED"` directly on `complete_task`. CANCELLED is always allowed from any role (no QA restriction).
+
+## Edit Task (v0.6)
+
+Edit mutable fields on pending or in_progress tasks. Each edit is logged to `edit_history` for full auditability.
+
+```
+edit_task({
+  task_id: "abc-123",
+  description: "Updated scope after PO decision",
+  scope: ["New item 1", "New item 2"],
+  done_when: "Updated exit criteria",
+  edited_by: "po"
+})
+```
+
+Editable fields: `title`, `description`, `scope`, `constraints`, `done_when`, `allow_self_pass`. Returns an error if the task is already done.
+
+## Bulk Operations (v0.6)
+
+Create or complete multiple tasks in a single atomic call.
+
+### `bulk_create_tasks`
+
+```
+bulk_create_tasks({
+  tasks: [
+    { role: "devteam", title: "A1: Fix auth", done_when: "..." },
+    { role: "devteam", title: "A2: Fix quota", done_when: "..." },
+    { role: "qa",      title: "A3: Retest auth", done_when: "...", depends_on: ["..."] }
+  ]
+})
+// → { created: 3, tasks: [{ id, role, title }, ...] }
+```
+
+All tasks are created or none are (transaction). Useful for retro action items or sprint planning.
+
+### `bulk_complete`
+
+```
+bulk_complete({
+  completions: [
+    { task_id: "abc-1", summary: "Done", from: "po" },
+    { task_id: "abc-2", summary: "Done", verdict: "PASS", from: "qa" },
+    { task_id: "abc-3", summary: "Skipped", verdict: "CANCELLED", from: "po" }
+  ]
+})
+// → { completed: 3, errors: 0, results: [...] }
+```
+
+All completions succeed or all roll back.
+
 ## QA Fix Chains (v0.5)
 
 The "QA FAIL → silence → forgotten" loop happens when creating the fix chain requires 3 manual `create_task` calls and DevTeam can mark their own fix PASS. Two tools close both gaps.
@@ -499,6 +584,14 @@ Full thread preserved on the task — no context lost between sessions
 ```
 
 ## Changelog
+
+### v0.6.0
+
+- **Pagination on `list_tasks`** — new optional params: `limit` (default 50), `offset`, `since` (ISO date filter on `assigned_at`), `until` (filter on `completed_at`). Response now includes `total_count`. Backwards compatible — existing callers get first 50 results.
+- **`CANCELLED` verdict + `cancel_task`** — new verdict value for intentionally skipped tasks. `cancel_task(task_id, reason, cancelled_by)` is a convenience wrapper. CANCELLED tasks are excluded from cycle-time and rejection-rate metrics; shown in their own bucket in `task_metrics`. No QA role restriction (anyone can cancel).
+- **`edit_task`** — edit mutable fields (`title`, `description`, `scope`, `constraints`, `done_when`, `allow_self_pass`) on pending/in_progress tasks. Each edit appends to `edit_history` with timestamp, editor, fields changed, and prior values. Returns error on done tasks.
+- **`bulk_create_tasks`** — atomically create N tasks in one call. All-or-nothing transaction. Returns created task stubs.
+- **`bulk_complete`** — atomically complete N tasks in one call. All-or-nothing transaction. Respects verdict_role_check per item.
 
 ### v0.5.0
 

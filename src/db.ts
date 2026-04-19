@@ -9,6 +9,9 @@ import type {
   CreateTaskInput,
   TaskTemplate,
   TaskMetrics,
+  EditHistoryEntry,
+  ListTasksOptions,
+  ListTasksResult,
 } from "./types.ts";
 
 const DB_PATH = process.env["TASKBOARD_DB"] || "taskboard.db";
@@ -55,6 +58,7 @@ export function getDb(): Database {
       "ALTER TABLE tasks ADD COLUMN trello_card_url TEXT",
       "ALTER TABLE tasks ADD COLUMN allow_self_pass INTEGER DEFAULT 0",
       "ALTER TABLE tasks ADD COLUMN claimed_by TEXT",
+      "ALTER TABLE tasks ADD COLUMN edit_history TEXT DEFAULT '[]'",
     ];
     for (const sql of migrations) {
       try {
@@ -104,6 +108,7 @@ function rowToTask(row: Record<string, unknown>): Task {
       ? Boolean(row["allow_self_pass"])
       : false,
     claimed_by: (row["claimed_by"] as string) || undefined,
+    edit_history: parseJson(row["edit_history"] as string | null) ?? [],
   };
 }
 
@@ -248,7 +253,7 @@ function hasUnresolvedQuestions(task: Task): boolean {
 
 /** List tasks that have unanswered questions */
 export function listTasksWithQuestions(role?: string): Task[] {
-  const tasks = listTasks(role, undefined, false);
+  const { tasks } = listTasks({ role, includeArchived: false });
   return tasks.filter((t) => t.status !== "done" && hasUnresolvedQuestions(t));
 }
 
@@ -263,8 +268,9 @@ export function completeTask(
   const task = getTask(id);
   if (!task) return null;
 
-  // Verdict role check: PASS/FAIL/PARTIAL restricted to qa/qa2 unless allow_self_pass
-  if (verdict && verdict !== "BLOCKED") {
+  // Verdict role check: PASS/FAIL/PARTIAL restricted to qa/qa2 unless allow_self_pass.
+  // BLOCKED and CANCELLED are always allowed (operational, not quality gates).
+  if (verdict && verdict !== "BLOCKED" && verdict !== "CANCELLED") {
     const caller = from?.toLowerCase();
     if (!caller) {
       // Grace period: log warning but allow
@@ -389,14 +395,168 @@ export function listChain(rootTaskId: string): Task[] | { error: string } {
   return result;
 }
 
-export function listTasks(
-  role?: string,
-  status?: TaskStatus,
-  includeArchived?: boolean,
-): Task[] {
-  let query = "SELECT * FROM tasks";
+/** Cancel a task with a reason. Convenience wrapper for complete_task(verdict=CANCELLED). */
+export function cancelTask(
+  id: string,
+  reason: string,
+  cancelledBy?: string,
+): Task | { error: string } {
+  const task = getTask(id);
+  if (!task) return { error: `Task not found: ${id}` };
+  if (task.status === "done") return { error: `Task ${id} is already done.` };
+
+  getDb()
+    .prepare(
+      "UPDATE tasks SET status = 'done', completed_at = datetime('now'), summary = ?, verdict = 'CANCELLED' WHERE id = ?",
+    )
+    .run(
+      `Cancelled${cancelledBy ? ` by ${cancelledBy}` : ""}. Reason: ${reason}`,
+      id,
+    );
+  return getTask(id)!;
+}
+
+/** Edit mutable fields on a pending or in_progress task. Appends to edit_history. */
+export function editTask(
+  id: string,
+  fields: Partial<
+    Pick<
+      Task,
+      | "title"
+      | "description"
+      | "scope"
+      | "constraints"
+      | "done_when"
+      | "allow_self_pass"
+    >
+  >,
+  editedBy?: string,
+): Task | { error: string } {
+  const task = getTask(id);
+  if (!task) return { error: `Task not found: ${id}` };
+  if (task.status === "done") {
+    return {
+      error: `Cannot edit a done task (id: ${id}). Only pending or in_progress tasks can be edited.`,
+    };
+  }
+
+  const editableKeys = [
+    "title",
+    "description",
+    "scope",
+    "constraints",
+    "done_when",
+    "allow_self_pass",
+  ] as const;
+  const changedFields: string[] = [];
+  const priorValues: Record<string, unknown> = {};
+  const setClauses: string[] = [];
+  const setParams: (string | number | null)[] = [];
+
+  for (const key of editableKeys) {
+    if (!(key in fields)) continue;
+    const newVal = fields[key];
+    const oldVal = task[key];
+    changedFields.push(key);
+    priorValues[key] = oldVal;
+
+    if (key === "scope" || key === "constraints") {
+      setClauses.push(`${key} = ?`);
+      setParams.push(newVal != null ? JSON.stringify(newVal) : null);
+    } else if (key === "allow_self_pass") {
+      setClauses.push(`${key} = ?`);
+      setParams.push(newVal ? 1 : 0);
+    } else {
+      setClauses.push(`${key} = ?`);
+      setParams.push((newVal as string | null | undefined) ?? null);
+    }
+  }
+
+  if (setClauses.length === 0) return task;
+
+  // Append to edit_history
+  const history: EditHistoryEntry[] = task.edit_history ?? [];
+  history.push({
+    timestamp: new Date().toISOString(),
+    edited_by: editedBy,
+    fields_changed: changedFields,
+    prior_values: priorValues,
+  });
+  setClauses.push("edit_history = ?");
+  setParams.push(JSON.stringify(history));
+  setParams.push(id);
+
+  getDb()
+    .prepare(`UPDATE tasks SET ${setClauses.join(", ")} WHERE id = ?`)
+    .run(...setParams);
+
+  return getTask(id)!;
+}
+
+/** Atomically create multiple tasks. All-or-nothing. */
+export function bulkCreateTasks(
+  inputs: CreateTaskInput[],
+): Task[] | { error: string } {
+  if (inputs.length === 0) return [];
+  try {
+    return getDb().transaction(() => {
+      return inputs.map((input) => createTask(input));
+    })();
+  } catch (e) {
+    return {
+      error: `bulk_create_tasks failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+}
+
+/** Atomically complete multiple tasks. All-or-nothing. */
+export function bulkComplete(
+  completions: {
+    task_id: string;
+    summary: string;
+    verdict?: TaskVerdict;
+    from?: string;
+  }[],
+): { results: (Task | { id: string; error: string })[] } | { error: string } {
+  if (completions.length === 0) return { results: [] };
+  try {
+    return getDb().transaction(() => {
+      const results: (Task | { id: string; error: string })[] = [];
+      for (const c of completions) {
+        const result = completeTask(c.task_id, c.summary, c.verdict, c.from);
+        if (!result) {
+          results.push({ id: c.task_id, error: "Task not found" });
+        } else if ("_warning" in result) {
+          results.push({
+            id: c.task_id,
+            error: (result as { _warning: string })._warning,
+          });
+        } else {
+          results.push(result as Task);
+        }
+      }
+      return { results };
+    })();
+  } catch (e) {
+    return {
+      error: `bulk_complete failed: ${e instanceof Error ? e.message : String(e)}`,
+    };
+  }
+}
+
+export function listTasks(opts: ListTasksOptions = {}): ListTasksResult {
+  const {
+    role,
+    status,
+    includeArchived,
+    limit = 50,
+    offset = 0,
+    since,
+    until,
+  } = opts;
+
   const conditions: string[] = [];
-  const params: string[] = [];
+  const params: (string | number)[] = [];
 
   if (role) {
     conditions.push("role = ?");
@@ -406,6 +566,14 @@ export function listTasks(
     conditions.push("status = ?");
     params.push(status);
   }
+  if (since) {
+    conditions.push("assigned_at >= ?");
+    params.push(since);
+  }
+  if (until) {
+    conditions.push("completed_at <= ?");
+    params.push(until);
+  }
 
   // Auto-archive: exclude done tasks older than 30 days unless requested
   if (!includeArchived && status !== "done") {
@@ -414,15 +582,23 @@ export function listTasks(
     );
   }
 
-  if (conditions.length > 0) {
-    query += " WHERE " + conditions.join(" AND ");
-  }
-  query += " ORDER BY assigned_at DESC";
+  const whereClause =
+    conditions.length > 0 ? " WHERE " + conditions.join(" AND ") : "";
+  const baseQuery = "SELECT * FROM tasks" + whereClause;
+  const countQuery = "SELECT COUNT(*) as count FROM tasks" + whereClause;
+
+  const countRow = getDb()
+    .prepare(countQuery)
+    .get(...params) as { count: number };
 
   const rows = getDb()
-    .prepare(query)
-    .all(...params) as Record<string, unknown>[];
-  return rows.map(rowToTask);
+    .prepare(baseQuery + " ORDER BY assigned_at DESC LIMIT ? OFFSET ?")
+    .all(...params, limit, offset) as Record<string, unknown>[];
+
+  return {
+    tasks: rows.map(rowToTask),
+    total_count: countRow.count,
+  };
 }
 
 /** Check if all dependencies of a task are done */
@@ -586,7 +762,10 @@ export function getMetrics(role?: string, days: number = 30): TaskMetrics {
   // Role filter helper
   const roleWhere = role ? ` AND role = '${role.toLowerCase()}'` : "";
 
-  // 1. Cycle time per role (avg minutes from assigned to completed)
+  // CANCELLED tasks are excluded from cycle-time and rejection-rate (operational, not quality metrics)
+  const notCancelledWhere = ` AND verdict != 'CANCELLED'`;
+
+  // 1. Cycle time per role — excludes CANCELLED
   const cycleRows = d
     .prepare(
       `SELECT role,
@@ -594,12 +773,12 @@ export function getMetrics(role?: string, days: number = 30): TaskMetrics {
         COUNT(*) as count
       FROM tasks
       WHERE status = 'done' AND completed_at IS NOT NULL
-        AND assigned_at > ${dateFilter}${roleWhere}
+        AND assigned_at > ${dateFilter}${roleWhere}${notCancelledWhere}
       GROUP BY role ORDER BY avg_minutes DESC`,
     )
     .all() as { role: string; avg_minutes: number; count: number }[];
 
-  // 2. Rejection rate per role (verdict breakdown)
+  // 2. Rejection rate per role — excludes CANCELLED
   const rejectionRows = d
     .prepare(
       `SELECT role,
@@ -611,7 +790,7 @@ export function getMetrics(role?: string, days: number = 30): TaskMetrics {
         SUM(CASE WHEN verdict IS NULL THEN 1 ELSE 0 END) as no_verdict
       FROM tasks
       WHERE status = 'done'
-        AND assigned_at > ${dateFilter}${roleWhere}
+        AND assigned_at > ${dateFilter}${roleWhere}${notCancelledWhere}
       GROUP BY role ORDER BY role`,
     )
     .all() as {
@@ -624,7 +803,7 @@ export function getMetrics(role?: string, days: number = 30): TaskMetrics {
     no_verdict: number;
   }[];
 
-  // 3. Verdict distribution (totals)
+  // 3. Verdict distribution (totals, includes CANCELLED as its own bucket)
   const verdictRow = d
     .prepare(
       `SELECT
@@ -632,6 +811,7 @@ export function getMetrics(role?: string, days: number = 30): TaskMetrics {
         SUM(CASE WHEN verdict = 'FAIL' THEN 1 ELSE 0 END) as fail,
         SUM(CASE WHEN verdict = 'PARTIAL' THEN 1 ELSE 0 END) as partial,
         SUM(CASE WHEN verdict = 'BLOCKED' THEN 1 ELSE 0 END) as blocked,
+        SUM(CASE WHEN verdict = 'CANCELLED' THEN 1 ELSE 0 END) as cancelled,
         SUM(CASE WHEN verdict IS NULL THEN 1 ELSE 0 END) as none
       FROM tasks
       WHERE status = 'done'
@@ -642,6 +822,7 @@ export function getMetrics(role?: string, days: number = 30): TaskMetrics {
     fail: number;
     partial: number;
     blocked: number;
+    cancelled: number;
     none: number;
   };
 
@@ -697,6 +878,7 @@ export function getMetrics(role?: string, days: number = 30): TaskMetrics {
       FAIL: verdictRow?.fail ?? 0,
       PARTIAL: verdictRow?.partial ?? 0,
       BLOCKED: verdictRow?.blocked ?? 0,
+      CANCELLED: verdictRow?.cancelled ?? 0,
       none: verdictRow?.none ?? 0,
     },
     throughput: throughputRows,
