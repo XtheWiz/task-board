@@ -69,9 +69,12 @@ create_task({
     must: ["Use sliding window algorithm", "Return 429 with Retry-After header"],
     must_not: ["Change existing auth logic", "Add new dependencies"]
   },
-  done_when: "Rate limiter active on auth routes, returns 429 after 5 attempts per minute"
+  done_when: "Rate limiter active on auth routes, returns 429 after 5 attempts per minute",
+  allow_self_pass: false   // default — only qa/qa2 may set PASS/FAIL/PARTIAL verdicts
 })
 ```
+
+Set `allow_self_pass: true` for infra or devops tasks where QA sign-off isn't applicable and the implementing role should be able to mark their own work PASS.
 
 ### `receive_task`
 
@@ -81,7 +84,7 @@ Pull your current task. Automatically marks it as `in_progress`.
 receive_task({ role: "backend" })
 ```
 
-Returns the oldest pending/in-progress task for that role. If a task is `pending`, it transitions to `in_progress` when received.
+Returns the oldest pending task for that role with dependencies met, marks it `in_progress`, and records `claimed_by` atomically. Two simultaneous `receive_task` calls for the same role will return different tasks — no double-claim possible.
 
 ### `update_task`
 
@@ -103,11 +106,12 @@ Mark a task as done with a summary of what was accomplished. Optionally include 
 complete_task({
   task_id: "abc-123",
   summary: "Added sliding window rate limiter in src/middleware/rate-limit.ts. Applied to all /auth/* routes. Tests pass.",
-  verdict: "PASS"
+  verdict: "PASS",
+  from: "qa"     // required when setting PASS/FAIL/PARTIAL — enforces verdict_role_check
 })
 ```
 
-Verdict values: `PASS`, `FAIL`, `PARTIAL`, `BLOCKED`. Useful for QA tasks where downstream routing depends on the outcome. The verdict is stored and shown in `list_tasks` output.
+Verdict values: `PASS`, `FAIL`, `PARTIAL`, `BLOCKED`. **`PASS`, `FAIL`, and `PARTIAL` are restricted to `qa` and `qa2` roles** unless the task was created with `allow_self_pass: true`. `BLOCKED` is always allowed (means "couldn't test", not "tested and passed"). If `from` is omitted when setting a verdict, a warning is logged and the call is accepted (one-cycle grace period).
 
 ### `list_tasks`
 
@@ -307,6 +311,44 @@ push_trello({ task_id: "abc-123" })
 // → "Card moved to Review with summary comment"
 ```
 
+## QA Fix Chains (v0.5)
+
+The "QA FAIL → silence → forgotten" loop happens when creating the fix chain requires 3 manual `create_task` calls and DevTeam can mark their own fix PASS. Two tools close both gaps.
+
+### `auto_chain_on_fail`
+
+Single call that fans out from a QA FAIL task. Creates a `devteam-fix` task and a `qa-retest` task with proper `parent_task_id` and `depends_on` linkage. QA calls this directly when the bug is unambiguous — no PO gate required.
+
+```
+auto_chain_on_fail({
+  qa_task_id: "abc-123",   // the task that just got verdict=FAIL
+  fix_role: "devteam"      // default: "devteam"
+})
+// → {
+//     fix_task_id: "def-456",
+//     retest_task_id: "ghi-789",
+//     fix_task: { role: "devteam", title: "Fix: Login screen blank", ... },
+//     retest_task: { role: "qa", depends_on: ["def-456"], ... }
+//   }
+```
+
+The `qa-retest` task uses the `qa-test` template if it exists (inheriting no-DEMO_MODE and screenshot constraints), otherwise creates a basic retest task.
+
+### `list_chain`
+
+Walk the full task chain rooted at any task ID — recursively follows `parent_task_id` children and reverse `depends_on` links. Returns the complete FAIL→fix→retest history in one call.
+
+```
+list_chain({ root_task_id: "abc-123" })
+// → [
+//     { id: "abc-123", role: "qa",      status: "done",        verdict: "FAIL",  title: "Login screen blank" },
+//     { id: "def-456", role: "devteam", status: "done",        verdict: null,    title: "Fix: Login screen blank" },
+//     { id: "ghi-789", role: "qa",      status: "in_progress", verdict: null,    title: "Retest: Login screen blank" }
+//   ]
+```
+
+Complements `list_subtasks` (one level) — `list_chain` walks the whole tree and handles depends_on cross-links.
+
 ## Task Lifecycle
 
 ```
@@ -457,6 +499,18 @@ Full thread preserved on the task — no context lost between sessions
 ```
 
 ## Changelog
+
+### v0.5.0
+
+- **`auto_chain_on_fail`** — single call fans out from a QA FAIL task: creates a `devteam-fix` task + a `qa-retest` task (from `qa-test` template if available) with `parent_task_id` and `depends_on` wired up automatically. Replaces 3 manual `create_task` calls.
+- **Verdict role check** — `complete_task` now enforces that `PASS`/`FAIL`/`PARTIAL` verdicts may only be set by `qa` or `qa2` roles. Stops DevTeam from self-approving their own fixes. Override per-task with `allow_self_pass: true` at creation time (for infra/devops tasks). `BLOCKED` is always allowed. Missing `from` field logs a warning and accepts (one-cycle grace period).
+- **`allow_self_pass` flag** — new boolean field on `create_task` (default `false`). Set `true` to opt a task out of the QA-only verdict restriction.
+- **`list_chain`** — recursively walks the full task chain from a root task ID, following `parent_task_id` children and reverse `depends_on` links. Returns the complete FAIL→fix→retest history in one call. Cycle-safe.
+- **Atomic `receive_task`** — claim is now wrapped in a SQLite transaction with a `claimed_by` stamp (`role-timestamp`). Two simultaneous `receive_task` calls for the same role return different tasks — no double-claim possible.
+
+### v0.4.1
+
+- **`create_trello_card`** — create a Trello card for a task that was filed directly in Task Board (not via `sync_trello`). Stores the card URL back on the task for future auto-push.
 
 ### v0.4.0
 

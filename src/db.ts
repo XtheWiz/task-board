@@ -53,6 +53,8 @@ export function getDb(): Database {
       "ALTER TABLE tasks ADD COLUMN depends_on TEXT",
       "ALTER TABLE tasks ADD COLUMN parent_task_id TEXT",
       "ALTER TABLE tasks ADD COLUMN trello_card_url TEXT",
+      "ALTER TABLE tasks ADD COLUMN allow_self_pass INTEGER DEFAULT 0",
+      "ALTER TABLE tasks ADD COLUMN claimed_by TEXT",
     ];
     for (const sql of migrations) {
       try {
@@ -98,6 +100,10 @@ function rowToTask(row: Record<string, unknown>): Task {
     trello_card_id: (row["trello_card_id"] as string) || undefined,
     trello_board_id: (row["trello_board_id"] as string) || undefined,
     trello_card_url: (row["trello_card_url"] as string) || undefined,
+    allow_self_pass: row["allow_self_pass"]
+      ? Boolean(row["allow_self_pass"])
+      : false,
+    claimed_by: (row["claimed_by"] as string) || undefined,
   };
 }
 
@@ -113,8 +119,8 @@ function parseJson<T>(value: string | null): T | undefined {
 export function createTask(input: CreateTaskInput): Task {
   const id = randomUUIDv7();
   const stmt = getDb().prepare(`
-    INSERT INTO tasks (id, role, title, description, scope, context_files, constraints, done_when, depends_on, parent_task_id, trello_card_id, trello_board_id)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO tasks (id, role, title, description, scope, context_files, constraints, done_when, depends_on, parent_task_id, trello_card_id, trello_board_id, allow_self_pass)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `);
   stmt.run(
     id,
@@ -129,6 +135,7 @@ export function createTask(input: CreateTaskInput): Task {
     input.parent_task_id ?? null,
     input.trello_card_id ?? null,
     input.trello_board_id ?? null,
+    input.allow_self_pass ? 1 : 0,
   );
   return getTask(id)!;
 }
@@ -141,26 +148,50 @@ export function getTask(id: string): Task | null {
 }
 
 export function receiveTask(role: string): Task | null {
-  // Get all pending/in_progress tasks for this role, ordered by assignment time
-  const rows = getDb()
-    .prepare(
-      "SELECT * FROM tasks WHERE role = ? AND status IN ('pending', 'in_progress') ORDER BY assigned_at ASC",
-    )
-    .all(role.toLowerCase()) as Record<string, unknown>[];
+  const normalizedRole = role.toLowerCase();
+  const claimStamp = `${normalizedRole}-${Date.now()}`;
 
-  for (const row of rows) {
-    const task = rowToTask(row);
-    // Skip tasks with unmet dependencies
-    if (!areDependenciesMet(task)) continue;
-    if (task.status === "pending") {
-      getDb()
-        .prepare("UPDATE tasks SET status = 'in_progress' WHERE id = ?")
-        .run(task.id);
-      task.status = "in_progress";
+  // Atomic claim: use a transaction so two simultaneous callers can't double-claim.
+  // Priority: pending tasks first, then unclaimed in_progress (legacy/orphaned).
+  return getDb().transaction(() => {
+    const rows = getDb()
+      .prepare(
+        "SELECT * FROM tasks WHERE role = ? AND status IN ('pending', 'in_progress') ORDER BY assigned_at ASC",
+      )
+      .all(normalizedRole) as Record<string, unknown>[];
+
+    let legacyInProgress: Task | null = null;
+
+    for (const row of rows) {
+      const task = rowToTask(row);
+      if (!areDependenciesMet(task)) continue;
+
+      if (task.status === "pending") {
+        // Claim this pending task atomically
+        getDb()
+          .prepare(
+            "UPDATE tasks SET status = 'in_progress', claimed_by = ? WHERE id = ?",
+          )
+          .run(claimStamp, task.id);
+        return getTask(task.id);
+      }
+
+      // in_progress + already claimed — skip (another agent holds it)
+      if (task.claimed_by) continue;
+
+      // in_progress + no claimed_by — legacy task, keep as fallback
+      if (!legacyInProgress) legacyInProgress = task;
     }
-    return task;
-  }
-  return null;
+
+    // No pending tasks — claim the first unclaimed in_progress (legacy)
+    if (legacyInProgress) {
+      getDb()
+        .prepare("UPDATE tasks SET claimed_by = ? WHERE id = ?")
+        .run(claimStamp, legacyInProgress.id);
+      return getTask(legacyInProgress.id);
+    }
+    return null;
+  })();
 }
 
 export function updateTask(
@@ -221,13 +252,32 @@ export function listTasksWithQuestions(role?: string): Task[] {
   return tasks.filter((t) => t.status !== "done" && hasUnresolvedQuestions(t));
 }
 
+const VERDICT_QA_ROLES = new Set(["qa", "qa2"]);
+
 export function completeTask(
   id: string,
   summary: string,
   verdict?: TaskVerdict,
-): Task | null {
+  from?: string,
+): Task | (Task & { _warning: string }) | null {
   const task = getTask(id);
   if (!task) return null;
+
+  // Verdict role check: PASS/FAIL/PARTIAL restricted to qa/qa2 unless allow_self_pass
+  if (verdict && verdict !== "BLOCKED") {
+    const caller = from?.toLowerCase();
+    if (!caller) {
+      // Grace period: log warning but allow
+      console.warn(
+        `[verdict_role_check] complete_task called with verdict=${verdict} but no 'from' field — accepted with warning (grace period)`,
+      );
+    } else if (!VERDICT_QA_ROLES.has(caller) && !task.allow_self_pass) {
+      return {
+        ...task,
+        _warning: `REJECTED: Only qa/qa2 may set verdict=${verdict}. Use allow_self_pass=true at task creation for infra/devops tasks. Caller: ${caller}`,
+      } as Task & { _warning: string };
+    }
+  }
 
   if (verdict) {
     getDb()
@@ -244,6 +294,99 @@ export function completeTask(
   }
 
   return getTask(id);
+}
+
+/** Fan-out: create devteam-fix + qa-retest chain from a QA FAIL task in one call. */
+export function autoChainOnFail(
+  qaTaskId: string,
+  fixRole: string = "devteam",
+): { fixTask: Task; retestTask: Task } | { error: string } {
+  const qaTask = getTask(qaTaskId);
+  if (!qaTask) return { error: `QA task not found: ${qaTaskId}` };
+
+  const fixTask = createTask({
+    role: fixRole,
+    title: `Fix: ${qaTask.title}`,
+    description: `Auto-created from QA FAIL.\n\nParent QA task: ${qaTask.title} (${qaTaskId})\n\nFAIL summary:\n${qaTask.summary ?? "(no summary yet)"}`,
+    done_when:
+      "Bug is fixed, all acceptance criteria from parent QA task pass.",
+    parent_task_id: qaTaskId,
+    context_files: qaTask.context_files,
+  });
+
+  // Use qa-test template if it exists, otherwise create a basic retest task
+  const tmpl = getTemplate("qa-test");
+  let retestTask: Task;
+  if (tmpl) {
+    const fromTemplate = createTaskFromTemplate(
+      "qa-test",
+      qaTaskId,
+      qaTask.title,
+    );
+    if (!fromTemplate) {
+      return { error: "Failed to create retest task from qa-test template" };
+    }
+    // Inject depends_on after creation
+    getDb()
+      .prepare("UPDATE tasks SET depends_on = ? WHERE id = ?")
+      .run(JSON.stringify([fixTask.id]), fromTemplate.id);
+    retestTask = getTask(fromTemplate.id)!;
+  } else {
+    retestTask = createTask({
+      role: "qa",
+      title: `Retest: ${qaTask.title}`,
+      description: `Auto-created retest for fix task ${fixTask.id}.\n\nOriginal QA FAIL: ${qaTask.title} (${qaTaskId})`,
+      done_when:
+        "All items from original QA task pass on simulator. Screenshot evidence attached.",
+      depends_on: [fixTask.id],
+      parent_task_id: qaTaskId,
+      context_files: qaTask.context_files,
+    });
+  }
+
+  return { fixTask, retestTask };
+}
+
+/** Walk the full task chain rooted at root_task_id. Returns ordered list of all linked tasks. */
+export function listChain(rootTaskId: string): Task[] | { error: string } {
+  const root = getTask(rootTaskId);
+  if (!root) return { error: `Task not found: ${rootTaskId}` };
+
+  const visited = new Set<string>();
+  const result: Task[] = [];
+
+  function collect(task: Task) {
+    if (visited.has(task.id)) return; // cycle guard
+    visited.add(task.id);
+    result.push(task);
+
+    // Walk down: direct children via parent_task_id
+    const children = getDb()
+      .prepare(
+        "SELECT * FROM tasks WHERE parent_task_id = ? ORDER BY assigned_at ASC",
+      )
+      .all(task.id) as Record<string, unknown>[];
+    for (const row of children) {
+      collect(rowToTask(row));
+    }
+
+    // Walk sideways: tasks that depend on this task (reverse depends_on)
+    const dependents = getDb()
+      .prepare("SELECT * FROM tasks ORDER BY assigned_at ASC")
+      .all() as Record<string, unknown>[];
+    for (const row of dependents) {
+      const candidate = rowToTask(row);
+      if (
+        !visited.has(candidate.id) &&
+        candidate.depends_on?.includes(task.id)
+      ) {
+        collect(candidate);
+      }
+    }
+  }
+
+  collect(root);
+  return result;
 }
 
 export function listTasks(

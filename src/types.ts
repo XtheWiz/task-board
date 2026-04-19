@@ -21,6 +21,8 @@ export interface Task {
   trello_card_id?: string;
   trello_board_id?: string;
   trello_card_url?: string;
+  allow_self_pass?: boolean;
+  claimed_by?: string;
 }
 
 export type UpdateType =
@@ -49,6 +51,7 @@ export interface CreateTaskInput {
   parent_task_id?: string;
   trello_card_id?: string;
   trello_board_id?: string;
+  allow_self_pass?: boolean;
 }
 
 export interface TrelloConfig {

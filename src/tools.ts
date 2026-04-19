@@ -45,6 +45,12 @@ export function registerTools(server: McpServer) {
         .describe(
           "Parent task ID — links this task to a prior task for context chain",
         ),
+      allow_self_pass: z
+        .boolean()
+        .optional()
+        .describe(
+          "Allow non-QA roles to set PASS/FAIL/PARTIAL verdicts on this task. Default false. Use for infra/devops tasks where QA sign-off is not applicable.",
+        ),
     },
     async (params) => {
       const task = db.createTask(params);
@@ -127,7 +133,7 @@ export function registerTools(server: McpServer) {
 
   server.tool(
     "complete_task",
-    "Mark a task as done with a completion summary and optional verdict",
+    "Mark a task as done with a completion summary and optional verdict. PASS/FAIL/PARTIAL verdicts are restricted to qa/qa2 roles unless the task was created with allow_self_pass=true.",
     {
       task_id: z.string().describe("The task ID to complete"),
       summary: z
@@ -141,9 +147,25 @@ export function registerTools(server: McpServer) {
         .describe(
           "Task outcome verdict (especially for QA tasks). PASS = all checks passed, FAIL = defects found, PARTIAL = some checks passed but gaps remain, BLOCKED = could not test",
         ),
+      from: z
+        .string()
+        .optional()
+        .describe(
+          "Role completing this task (e.g. 'devteam', 'qa', 'qa2'). Required when setting a verdict — enforces that only qa/qa2 may set PASS/FAIL/PARTIAL.",
+        ),
     },
-    async ({ task_id, summary, verdict }) => {
-      const task = db.completeTask(task_id, summary, verdict);
+    async ({ task_id, summary, verdict, from }) => {
+      const task = db.completeTask(task_id, summary, verdict, from);
+      if (task && "_warning" in task) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: (task as { _warning: string })._warning,
+            },
+          ],
+        };
+      }
       if (!task) {
         return {
           content: [
@@ -622,6 +644,81 @@ export function registerTools(server: McpServer) {
             type: "text" as const,
             text: JSON.stringify(summary, null, 2),
           },
+        ],
+      };
+    },
+  );
+
+  // --- Chain tools ---
+
+  server.tool(
+    "auto_chain_on_fail",
+    "Single call that fans out from a QA FAIL task: creates a devteam-fix task + a qa-retest task (from qa-test template if available) with proper parent_task_id and depends_on linkage. QA calls this directly when a bug is unambiguous — no PO gate required.",
+    {
+      qa_task_id: z
+        .string()
+        .describe("The QA task ID that received a FAIL verdict"),
+      fix_role: z
+        .string()
+        .optional()
+        .describe("Role to assign the fix task to (default: 'devteam')"),
+    },
+    async ({ qa_task_id, fix_role }) => {
+      const result = db.autoChainOnFail(qa_task_id, fix_role);
+      if ("error" in result) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${result.error}` }],
+        };
+      }
+      return {
+        content: [
+          {
+            type: "text" as const,
+            text: JSON.stringify(
+              {
+                fix_task_id: result.fixTask.id,
+                retest_task_id: result.retestTask.id,
+                fix_task: result.fixTask,
+                retest_task: result.retestTask,
+              },
+              null,
+              2,
+            ),
+          },
+        ],
+      };
+    },
+  );
+
+  server.tool(
+    "list_chain",
+    "Recursively walk the full task chain rooted at root_task_id — walks parent_task_id children and reverse depends_on links. Shows the complete FAIL→fix→retest history in one call.",
+    {
+      root_task_id: z
+        .string()
+        .describe("The root task ID to walk the chain from"),
+    },
+    async ({ root_task_id }) => {
+      const result = db.listChain(root_task_id);
+      if (!Array.isArray(result)) {
+        return {
+          content: [{ type: "text" as const, text: `Error: ${result.error}` }],
+        };
+      }
+      const summary = result.map((t) => ({
+        id: t.id,
+        role: t.role,
+        status: t.status,
+        verdict: t.verdict ?? null,
+        title: t.title,
+        parent_task_id: t.parent_task_id ?? null,
+        depends_on: t.depends_on ?? null,
+        assigned_at: t.assigned_at,
+        completed_at: t.completed_at ?? null,
+      }));
+      return {
+        content: [
+          { type: "text" as const, text: JSON.stringify(summary, null, 2) },
         ],
       };
     },
