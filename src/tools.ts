@@ -1,7 +1,7 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import * as db from "./db.ts";
-import { syncFromTrello, pushToTrello } from "./trello.ts";
+import { syncFromTrello, pushToTrello, createTrelloCard } from "./trello.ts";
 
 export function registerTools(server: McpServer) {
   server.tool(
@@ -226,6 +226,48 @@ export function registerTools(server: McpServer) {
           { type: "text" as const, text: JSON.stringify(summary, null, 2) },
         ],
       };
+    },
+  );
+
+  server.tool(
+    "create_trello_card",
+    "Create a new Trello card from a Task Board task and store the card URL back on the task. Use this when a task was created directly in the Board (not via sync_trello) and needs a Trello card for founder visibility.",
+    {
+      task_id: z
+        .string()
+        .describe("Task Board task ID to create a Trello card for"),
+      list_name: z
+        .string()
+        .optional()
+        .describe(
+          "Trello list to create the card in (default: 'Backlog'). List is created if it does not exist.",
+        ),
+    },
+    async ({ task_id, list_name }) => {
+      try {
+        const result = await createTrelloCard(task_id, list_name);
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: result.success
+                ? `✅ ${result.message}`
+                : `❌ ${result.message}`,
+            },
+          ],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text:
+                "create_trello_card failed: " +
+                (e instanceof Error ? e.message : String(e)),
+            },
+          ],
+        };
+      }
     },
   );
 

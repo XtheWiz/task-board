@@ -35,7 +35,8 @@ export function getDb(): Database {
         summary TEXT,
         updates TEXT DEFAULT '[]',
         trello_card_id TEXT,
-        trello_board_id TEXT
+        trello_board_id TEXT,
+        trello_card_url TEXT
       )
     `);
     db.exec(`
@@ -51,6 +52,7 @@ export function getDb(): Database {
       "ALTER TABLE tasks ADD COLUMN verdict TEXT",
       "ALTER TABLE tasks ADD COLUMN depends_on TEXT",
       "ALTER TABLE tasks ADD COLUMN parent_task_id TEXT",
+      "ALTER TABLE tasks ADD COLUMN trello_card_url TEXT",
     ];
     for (const sql of migrations) {
       try {
@@ -95,6 +97,7 @@ function rowToTask(row: Record<string, unknown>): Task {
     parent_task_id: (row["parent_task_id"] as string) || undefined,
     trello_card_id: (row["trello_card_id"] as string) || undefined,
     trello_board_id: (row["trello_board_id"] as string) || undefined,
+    trello_card_url: (row["trello_card_url"] as string) || undefined,
   };
 }
 
@@ -416,6 +419,19 @@ export function findTaskByTrelloCard(cardId: string): Task | null {
     .prepare("SELECT * FROM tasks WHERE trello_card_id = ?")
     .get(cardId) as Record<string, unknown> | null;
   return row ? rowToTask(row) : null;
+}
+
+/** Store Trello card ID + URL back on a Task Board task (called after create_trello_card). */
+export function setTrelloCard(
+  taskId: string,
+  cardId: string,
+  cardUrl: string,
+): void {
+  getDb()
+    .prepare(
+      "UPDATE tasks SET trello_card_id = ?, trello_card_url = ? WHERE id = ?",
+    )
+    .run(cardId, cardUrl, taskId);
 }
 
 // --- Metrics ---

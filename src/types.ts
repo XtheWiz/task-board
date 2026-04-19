@@ -20,6 +20,7 @@ export interface Task {
   updates?: TaskUpdate[];
   trello_card_id?: string;
   trello_board_id?: string;
+  trello_card_url?: string;
 }
 
 export type UpdateType =

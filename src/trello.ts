@@ -1,4 +1,4 @@
-import type { TrelloConfig, ParsedCard } from "./types.ts";
+import type { TrelloConfig, ParsedCard, Task } from "./types.ts";
 import * as db from "./db.ts";
 
 const AGENT_TAG_REGEX = /^\[(\w+)\]\s*/;
@@ -370,6 +370,101 @@ export async function syncFromTrello(): Promise<{
   db.setSyncState("last_trello_sync", new Date().toISOString());
 
   return { created, skipped, claimed_by_others: claimed, errors };
+}
+
+function formatTaskDescription(task: Task): string {
+  const lines: string[] = [];
+
+  if (task.description) {
+    lines.push("## Description", "", task.description, "");
+  }
+
+  if (task.scope?.length) {
+    lines.push("## Scope", "");
+    for (const item of task.scope) lines.push(`- ${item}`);
+    lines.push("");
+  }
+
+  if (task.constraints) {
+    const { must, must_not } = task.constraints;
+    if (must?.length || must_not?.length) {
+      lines.push("## Constraints", "");
+      if (must?.length) {
+        lines.push("**Must:**");
+        for (const item of must) lines.push(`- ${item}`);
+        lines.push("");
+      }
+      if (must_not?.length) {
+        lines.push("**Must not:**");
+        for (const item of must_not) lines.push(`- ${item}`);
+        lines.push("");
+      }
+    }
+  }
+
+  if (task.context_files?.length) {
+    lines.push("## Context files", "");
+    for (const f of task.context_files) lines.push(`- \`${f}\``);
+    lines.push("");
+  }
+
+  lines.push("---", `**Done when:** ${task.done_when}`, "");
+  lines.push(`_Task Board ID: ${task.id}_`);
+
+  return lines.join("\n");
+}
+
+export async function createTrelloCard(
+  taskId: string,
+  listName?: string,
+): Promise<{ success: boolean; message: string; cardUrl?: string }> {
+  const task = db.getTask(taskId);
+  if (!task) return { success: false, message: "Task not found" };
+
+  if (task.trello_card_id) {
+    return {
+      success: false,
+      message: `Task already linked to Trello card: ${task.trello_card_url ?? task.trello_card_id}`,
+    };
+  }
+
+  const config = getConfig();
+  const targetListName = listName ?? "Backlog";
+
+  // Find or create the target list
+  const lists = await trelloGet<TrelloList[]>(
+    `/boards/${config.boardId}/lists`,
+    config,
+  );
+  let targetList = lists.find(
+    (l) => l.name.toLowerCase() === targetListName.toLowerCase(),
+  );
+  if (!targetList) {
+    const fullBoardId = await getFullBoardId(config);
+    targetList = (await trelloPost("/lists", config, {
+      name: targetListName,
+      idBoard: fullBoardId,
+      pos: "bottom",
+    })) as TrelloList;
+  }
+
+  const cardTitle = `[${task.role.toUpperCase()}] ${task.title}`;
+  const desc = formatTaskDescription(task);
+
+  const card = (await trelloPost("/cards", config, {
+    name: cardTitle,
+    desc,
+    idList: targetList.id,
+    pos: "bottom",
+  })) as { id: string; shortUrl: string };
+
+  db.setTrelloCard(taskId, card.id, card.shortUrl);
+
+  return {
+    success: true,
+    message: `Trello card created: ${card.shortUrl}`,
+    cardUrl: card.shortUrl,
+  };
 }
 
 export async function pushToTrello(
